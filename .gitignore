@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.env.local
+.DS_Store
+runtime/
+!runtime/README.md
+bedrock-server-1.26.10.4-linux/

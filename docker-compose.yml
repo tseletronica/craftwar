@@ -1,0 +1,165 @@
+x-bedrock-env: &bedrock-env
+  TZ: ${TZ:-America/Sao_Paulo}
+  SERVER_PORT: 19132
+  SERVER_PORT_V6: 19133
+  NETWORK_BASE_URL: ${NETWORK_BASE_URL:-http://api:8080}
+  NETWORK_AUTOSAVE_INTERVAL_TICKS: ${NETWORK_AUTOSAVE_INTERVAL_TICKS:-1200}
+  NETWORK_HEARTBEAT_INTERVAL_TICKS: ${NETWORK_HEARTBEAT_INTERVAL_TICKS:-200}
+  TRANSFER_HOST: ${TRANSFER_HOST:-192.168.100.3}
+  ALLOW_CHEATS: ${ALLOW_CHEATS:-true}
+  ADMIN_CREATIVE_GAMERTAGS: ${ADMIN_CREATIVE_GAMERTAGS:-SerafimM2025}
+  ADMIN_OPERATOR_XUIDS: ${ADMIN_OPERATOR_XUIDS:-2535408045948271}
+  ALLOW_EXTRA_DIMENSIONS: ${ALLOW_EXTRA_DIMENSIONS:-false}
+  CAPITAL_PUBLIC_PORT: ${CAPITAL_PORT:-19132}
+  ARENAS_PUBLIC_PORT: ${ARENAS_PORT:-19133}
+  FIRE_PUBLIC_PORT: ${FIRE_PORT:-19134}
+  WATER_PUBLIC_PORT: ${WATER_PORT:-19135}
+  EARTH_PUBLIC_PORT: ${EARTH_PORT:-19136}
+  AIR_PUBLIC_PORT: ${AIR_PORT:-19137}
+  EXPLORATION_PUBLIC_PORT: ${EXPLORATION_PORT:-19138}
+
+x-bedrock-service: &bedrock-service
+  build:
+    context: .
+    dockerfile: ./docker/bedrock-local/Dockerfile
+    args:
+      BEDROCK_SOURCE_DIR: ${BEDROCK_SOURCE_DIR:-bedrock-server-1.26.10.4-linux}
+  image: nations-bedrock-local:1.26.10.4
+  restart: unless-stopped
+
+services:
+  api:
+    build:
+      context: ./backend
+    container_name: nations-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${API_PORT:-8080}:8080"
+
+  capital:
+    <<: *bedrock-service
+    container_name: bds-capital
+    environment:
+      <<: *bedrock-env
+      TZ: ${TZ:-America/Sao_Paulo}
+      SERVER_NAME: Capital
+      LEVEL_NAME: capital
+      SERVER_SLUG: capital
+      GAMEMODE: survival
+      DIFFICULTY: hard
+    ports:
+      - "${CAPITAL_PORT:-19132}:19132/udp"
+    volumes:
+      - ./runtime/capital:/data
+
+  arenas:
+    <<: *bedrock-service
+    container_name: bds-arenas
+    environment:
+      <<: *bedrock-env
+      TZ: ${TZ:-America/Sao_Paulo}
+      SERVER_NAME: Arenas
+      LEVEL_NAME: arenas
+      SERVER_SLUG: arenas
+      GAMEMODE: adventure
+      DIFFICULTY: hard
+    ports:
+      - "${ARENAS_PORT:-19133}:19132/udp"
+    volumes:
+      - ./runtime/arenas:/data
+
+  fire:
+    <<: *bedrock-service
+    container_name: bds-fire
+    environment:
+      <<: *bedrock-env
+      TZ: ${TZ:-America/Sao_Paulo}
+      SERVER_NAME: Nação do Fogo
+      LEVEL_NAME: fire
+      SERVER_SLUG: fire
+      WORLD_DISPLAY_NAME: Nação do Fogo
+      WORLD_TEMPLATE_DIR: /opt/world-template
+      GAMEMODE: survival
+      DIFFICULTY: hard
+    ports:
+      - "${FIRE_PORT:-19134}:19132/udp"
+    volumes:
+      - ./runtime/fire:/data
+      - "./Template Nação:/opt/world-template:ro"
+
+  water:
+    <<: *bedrock-service
+    container_name: bds-water
+    environment:
+      <<: *bedrock-env
+      TZ: ${TZ:-America/Sao_Paulo}
+      SERVER_NAME: Nação da Água
+      LEVEL_NAME: water
+      SERVER_SLUG: water
+      WORLD_DISPLAY_NAME: Nação da Água
+      WORLD_TEMPLATE_DIR: /opt/world-template
+      GAMEMODE: survival
+      DIFFICULTY: hard
+    ports:
+      - "${WATER_PORT:-19135}:19132/udp"
+    volumes:
+      - ./runtime/water:/data
+      - "./Template Nação:/opt/world-template:ro"
+
+  earth:
+    <<: *bedrock-service
+    container_name: bds-earth
+    environment:
+      <<: *bedrock-env
+      TZ: ${TZ:-America/Sao_Paulo}
+      SERVER_NAME: Nação da Terra
+      LEVEL_NAME: earth
+      SERVER_SLUG: earth
+      WORLD_DISPLAY_NAME: Nação da Terra
+      WORLD_TEMPLATE_DIR: /opt/world-template
+      GAMEMODE: survival
+      DIFFICULTY: hard
+    ports:
+      - "${EARTH_PORT:-19136}:19132/udp"
+    volumes:
+      - ./runtime/earth:/data
+      - "./Template Nação:/opt/world-template:ro"
+
+  air:
+    <<: *bedrock-service
+    container_name: bds-air
+    environment:
+      <<: *bedrock-env
+      TZ: ${TZ:-America/Sao_Paulo}
+      SERVER_NAME: Nação do Vento
+      LEVEL_NAME: air
+      SERVER_SLUG: air
+      WORLD_DISPLAY_NAME: Nação do Vento
+      WORLD_TEMPLATE_DIR: /opt/world-template
+      GAMEMODE: survival
+      DIFFICULTY: hard
+    ports:
+      - "${AIR_PORT:-19137}:19132/udp"
+    volumes:
+      - ./runtime/air:/data
+      - "./Template Nação:/opt/world-template:ro"
+
+  exploration:
+    <<: *bedrock-service
+    container_name: bds-exploration
+    environment:
+      <<: *bedrock-env
+      TZ: ${TZ:-America/Sao_Paulo}
+      SERVER_NAME: Mapa de Exploração
+      LEVEL_NAME: exploration
+      SERVER_SLUG: exploration
+      ALLOW_EXTRA_DIMENSIONS: "true"
+      WORLD_DISPLAY_NAME: Mapa de Exploração
+      GAMEMODE: survival
+      DIFFICULTY: hard
+    ports:
+      - "${EXPLORATION_PORT:-19138}:19132/udp"
+    volumes:
+      - ./runtime/exploration:/data
