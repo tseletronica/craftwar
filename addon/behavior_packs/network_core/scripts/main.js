@@ -9,6 +9,8 @@ import {
   disconnectPlayer,
   expelNationMember,
   getCachedBundle,
+  getTopRicos,
+  mintBalance,
   promoteNationMember,
   reloadPlayerBundle,
   rememberPersistentIdentity,
@@ -71,6 +73,30 @@ function formatDracoBalance(value) {
 function parsePayCommand(rawMessage) {
   const trimmed = String(rawMessage || '').trim();
   const match = trimmed.match(/^!pagar\s+(.+)\s+(-?\d+)$/i);
+
+  if (!match) {
+    return null;
+  }
+
+  let targetGamertag = String(match[1] || '').trim();
+  const amount = Number(match[2]);
+
+  if (
+    (targetGamertag.startsWith('"') && targetGamertag.endsWith('"')) ||
+    (targetGamertag.startsWith("'") && targetGamertag.endsWith("'"))
+  ) {
+    targetGamertag = targetGamertag.slice(1, -1).trim();
+  }
+
+  return {
+    targetGamertag,
+    amount
+  };
+}
+
+function parseMintCommand(rawMessage) {
+  const trimmed = String(rawMessage || '').trim();
+  const match = trimmed.match(/^!mint\s+(.+)\s+(-?\d+)$/i);
 
   if (!match) {
     return null;
@@ -566,6 +592,7 @@ world.afterEvents.playerSpawn.subscribe((event) => {
       return;
     }
 
+    send(player, '\u00a7a[NETWORK] Sincronizando perfil compartilhado...');
     const result = await connectPlayer(player);
     if (!result.ok) {
       send(player, `\u00a7c[NETWORK] Falha ao carregar seu perfil compartilhado: ${result.error}`);
@@ -574,24 +601,6 @@ world.afterEvents.playerSpawn.subscribe((event) => {
 
     const profile = result.bundle?.profile ?? {};
     sendLoginSummary(player, result.bundle);
-
-    if (false) {
-    const economy = result.bundle?.economy ?? {};
-    const kingdomName = readProfileValue(profile.kingdomName, 'Sem reino');
-    const nationName = readProfileValue(profile.nationName, 'Sem nação');
-    const race = readProfileValue(profile.race, 'Sem raça');
-    const className = readProfileValue(profile.className, 'Sem classe');
-    const title = readProfileValue(profile.title, 'Sem título');
-
-    send(player, `\u00a7a[NETWORK] Perfil carregado em \u00a7f${NETWORK_CONFIG.serverSlug}\u00a7a.`);
-    send(player, `\u00a77Saldo compartilhado: \u00a7e${formatDracoBalance(economy.balance ?? 0)}`);
-    send(player, `\u00a77Reino atual: \u00a76${kingdomName}`);
-    send(player, `\u00a77Nação atual: \u00a7b${nationName}`);
-    send(player, `\u00a77Raça: \u00a7d${race}`);
-    send(player, `\u00a77Classe: \u00a76${className}`);
-    send(player, `\u00a77Título: \u00a7a${title}`);
-
-    }
 
     if (!String(profile.nationSlug || '').trim()) {
       queueNationSelection(player);
@@ -661,6 +670,7 @@ world.beforeEvents.chatSend.subscribe((event) => {
   const normalizedMessage = normalizeCommandText(rawMessage);
   const player = event.sender;
 
+  // Skip commands if handled by transfer logic
   if (maybeHandleTransferCommand(event)) {
     return;
   }
@@ -885,23 +895,58 @@ world.beforeEvents.chatSend.subscribe((event) => {
     return;
   }
 
-  if (message === '!saldo') {
+  if (message === '!ricos' || message === '!top' || message === '!milionarios') {
     event.cancel = true;
     system.run(async () => {
-      const refresh = await reloadPlayerBundle(player);
-      const bundle = refresh.ok ? refresh.bundle : getCachedBundle(player);
+      try {
+        send(player, '\u00a76[ECONOMIA] Buscando os jogadores mais ricos...');
+        const result = await getTopRicos();
 
-      if (!bundle) {
-        send(player, '\u00a7c[ECONOMIA] Não foi possível carregar seu saldo.');
-        return;
+        if (!result.ok) {
+          send(player, `\u00a7c[ECONOMIA] Falha ao carregar ranking: ${result.error}`);
+          return;
+        }
+
+        if (!result.top || result.top.length === 0) {
+          send(player, '\u00a7e[ECONOMIA] Nenhum jogador milionário encontrado no ranking ainda.');
+          return;
+        }
+
+        send(player, '\u00a76--- RANKING DE RICOS (DRACOS) ---');
+        result.top.forEach((item, index) => {
+          send(
+            player,
+            `\u00a7f${index + 1}. \u00a7b${item.gamertag}\u00a77: \u00a7e${formatDracoBalance(item.balance)}`
+          );
+        });
+        send(player, '\u00a76---------------------------------');
+      } catch (err) {
+        send(player, `\u00a7c[ECONOMIA] Erro interno ao processar ranking.`);
+        console.error(`RANKING_ERROR: ${err}`);
       }
+    });
+    return;
+  }
 
-      send(
-        player,
-        `\u00a7a[ECONOMIA] Seu saldo atual é \u00a7e${formatDracoBalance(bundle.economy?.balance ?? 0)}\u00a7a.`
-      );
-      if (!refresh.ok) {
-        send(player, `\u00a7e[ECONOMIA] Exibindo cache local (${refresh.error}).`);
+  if (message === '!saldo' || message === '!money') {
+    event.cancel = true;
+    system.run(async () => {
+      try {
+        send(player, '\u00a77[ECONOMIA] Consultando saldo atualizado...');
+        const refresh = await reloadPlayerBundle(player);
+        
+        if (!refresh.ok) {
+           send(player, `\u00a7c[ECONOMIA] Falha ao sincronizar: ${refresh.error}`);
+           return;
+        }
+
+        const balance = refresh.bundle?.economy?.balance ?? 0;
+        send(
+          player,
+          `\u00a7a[ECONOMIA] Seu saldo atual é \u00a7e${formatDracoBalance(balance)}\u00a7a.`
+        );
+      } catch (err) {
+        send(player, `\u00a7c[ECONOMIA] Erro ao consultar saldo.`);
       }
     });
     return;
@@ -1021,7 +1066,42 @@ world.beforeEvents.chatSend.subscribe((event) => {
         setCachedBalance(recipientPlayer, result.recipientBalance);
         send(
           recipientPlayer,
-          `\u00a7a[ECONOMIA] Você recebeu \u00a7e${formatDracoBalance(result.amount)}\u00a7a de \u00a7f${player.name}\u00a7a.`
+          `\u00a7a[DRACO] Você recebeu \u00a7e${formatDracoBalance(result.amount)}\u00a7a de \u00a7f${player.name}\u00a7a.`
+        );
+        send(recipientPlayer, `\u00a77Novo saldo: \u00a7e${formatDracoBalance(result.recipientBalance)}`);
+      }
+    });
+    return;
+  }
+
+  if (message.startsWith('!mint')) {
+    event.cancel = true;
+    const parsedCommand = parseMintCommand(rawMessage);
+
+    if (!parsedCommand) {
+      send(player, '\u00a7e[ADMIN] Uso: !mint <jogador> <valor>');
+      return;
+    }
+
+    system.run(async () => {
+      const result = await mintBalance(player, parsedCommand.targetGamertag, parsedCommand.amount);
+
+      if (!result.ok) {
+        send(player, `\u00a7c[ADMIN] Falha ao criar Dracos: ${result.error}`);
+        return;
+      }
+
+      send(
+        player,
+        `\u00a7b[ADMIN] Você criou \u00a7e${formatDracoBalance(result.amount)}\u00a7b para \u00a7f${result.recipientGamertag}\u00a7b.`
+      );
+
+      const recipientPlayer = findOnlinePlayerByGamertag(result.recipientGamertag);
+      if (recipientPlayer) {
+        setCachedBalance(recipientPlayer, result.recipientBalance);
+        send(
+          recipientPlayer,
+          `\u00a7a[DRACO] Você recebeu \u00a7e${formatDracoBalance(result.amount)}\u00a7a de \u00a7fAdministrador\u00a7a.`
         );
         send(recipientPlayer, `\u00a77Novo saldo: \u00a7e${formatDracoBalance(result.recipientBalance)}`);
       }

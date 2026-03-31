@@ -460,6 +460,68 @@ export async function transferBalance(player, targetGamertag, amount) {
   };
 }
 
+export async function mintBalance(player, targetGamertag, amount) {
+  const identity = getPlayerIdentity(player);
+  if (!identity.xuid) {
+    return { ok: false, error: 'invalid_player_id' };
+  }
+
+  const normalizedTargetGamertag = String(targetGamertag || '').trim();
+  const normalizedAmount = Number(amount);
+
+  if (!normalizedTargetGamertag) {
+    return { ok: false, error: 'recipient_not_found' };
+  }
+
+  if (!Number.isSafeInteger(normalizedAmount) || normalizedAmount <= 0) {
+    return { ok: false, error: 'invalid_amount' };
+  }
+
+  const response = await requestJson('POST', '/internal/economy/mint', {
+    xuid: identity.xuid,
+    gamertag: identity.gamertag,
+    serverSlug: NETWORK_CONFIG.serverSlug,
+    legacyXuids: identity.legacyXuids,
+    targetGamertag: normalizedTargetGamertag,
+    amount: normalizedAmount,
+    reason: 'admin_mint'
+  });
+
+  if (!response.ok || !response.data) {
+    return {
+      ok: false,
+      error: readErrorCode(response),
+      details: response.data?.details || null
+    };
+  }
+
+  return {
+    ok: true,
+    amount: Number(response.data.amount ?? normalizedAmount),
+    recipientBalance: Number(response.data.recipientBalance ?? 0),
+    recipientGamertag: String(response.data.recipientGamertag || normalizedTargetGamertag)
+  };
+}
+
+export async function getTopRicos() {
+  const response = await requestJson('GET', '/internal/economy/top');
+
+  if (!response.ok || !response.data) {
+    return {
+      ok: false,
+      error: readErrorCode(response)
+    };
+  }
+
+  return {
+    ok: true,
+    top: response.data.map(item => ({
+      gamertag: String(item.gamertag || '---'),
+      balance: Number(item.balance ?? 0)
+    }))
+  };
+}
+
 export async function chooseNation(player, nationSlug) {
   const identity = getPlayerIdentity(player);
   if (!identity.xuid) {

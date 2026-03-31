@@ -90,21 +90,22 @@ const EARTH_GEOLOGIST_BLOCKS = new Set([
 ]);
 
 const FEEDBACK_MESSAGES = {
-  air_dodge: '\u00a7e[HABILIDADE] Esquiva Fantasma!',
-  air_fall: '\u00a7e[HABILIDADE] Asas Invisiveis!',
-  air_flight: '\u00a7e[HABILIDADE] Engenheiro de Nuvens!',
-  air_gust: '\u00a7e[HABILIDADE] Rajada de Vento!',
-  earth_cleanse: '\u00a7a[HABILIDADE] Pureza da Terra!',
-  earth_geo: '\u00a7a[HABILIDADE] Geologo!',
-  earth_harvest: '\u00a7a[HABILIDADE] Colheita Farta!',
-  earth_meditation: '\u00a7a[HABILIDADE] Meditacao!',
-  earth_root: '\u00a7a[HABILIDADE] Raizes da Terra!',
-  fire_breath: '\u00a7c[HABILIDADE] Ultimo Suspiro!',
-  fire_ignite: '\u00a7c[HABILIDADE] Incendiar!',
-  fire_smelting: '\u00a7c[HABILIDADE] Fornalha Viva!',
-  water_guard: '\u00a79[HABILIDADE] Guarda Oceanica!',
-  water_harpoon: '\u00a79[HABILIDADE] Arpao!',
-  water_loot: '\u00a79[HABILIDADE] Coletor das Mares!'
+  air_dodge: '\u00a7e\u2728 ESQUIVA!',
+  air_fall: '\u00a7e\u2728 LEVEZA!',
+  air_flight: '\u00a7e\u2728 VOO!',
+  air_gust: '\u00a7e\u2728 RAJADA!',
+  earth_cleanse: '\u00a7a\ud83c\udf3f PUREZA!',
+  earth_geo: '\u00a7a\ud83c\udf3f GE\u00d3LOGO!',
+  earth_harvest: '\u00a7a\ud83c\udf3f COLHEITA!',
+  earth_meditation: '\u00a7a\ud83c\udf3f MEDITA\u00c7\u00c3O!',
+  earth_root: '\u00a7a\ud83c\udf3f RA\u00cdZES!',
+  fire_breath: '\u00a7c\ud83d\udd25 SOPRO FINAL!',
+  fire_berserker: '\u00a7c\ud83d\udd25 BERSERKER!',
+  fire_ignite: '\u00a7c\ud83d\udd25 INCENDIAR!',
+  fire_smelting: '\u00a7c\ud83d\udd25 FORJA!',
+  water_guard: '\u00a79\ud83d\udee1\ufe0f GUARDA!',
+  water_harpoon: '\u00a79\ud83d\udd31 ARP\u00c3O!',
+  water_loot: '\u00a79\ud83d\udca7 COLETOR!'
 };
 
 function normalizeText(value) {
@@ -669,7 +670,7 @@ function registerCombatHooks() {
         const currentHealth = Number(health?.currentValue ?? 20);
         const projectedHealth = currentHealth - Number(event.damage || 0);
 
-        if (projectedHealth <= 1 && Math.random() < 0.15) {
+        if (projectedHealth <= 1 && Math.random() < 0.3) {
           const location = {
             x: victim.location.x,
             y: victim.location.y,
@@ -714,6 +715,9 @@ function registerCombatHooks() {
       );
       if (missingHearts > 0) {
         multiplier += missingHearts * 0.1;
+        system.run(() => {
+          showFeedback(attacker, 'fire_berserker');
+        });
       }
 
       event.damage = Number(event.damage || 0) * multiplier;

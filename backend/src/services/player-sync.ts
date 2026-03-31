@@ -2,6 +2,7 @@ import { PoolClient } from "pg";
 import { z } from "zod";
 
 import { pool } from "../lib/db.js";
+import { isAdmin } from "./admin.js";
 
 export const joinPayloadSchema = z.object({
   xuid: z.string().min(1),
@@ -156,67 +157,89 @@ async function ensurePlayerAccount(client: PoolClient, playerId: string) {
 }
 
 export async function loadPlayerState(client: PoolClient, playerId: string) {
-  const stateResult = await client.query(
-    `
-      select
-        p.id as "playerId",
-        p.xuid,
-        p.gamertag,
-        p.race,
-        p.class_name as "className",
-        p.title,
-        n.slug as "nationSlug",
-        n.name as "nationName",
-        k.slug as "kingdomSlug",
-        k.name as "kingdomName",
-        c.id as "clanId",
-        c.name as "clanName",
-        c.tag as "clanTag",
-        coalesce(a.balance, 0) as "dracoBalance",
-        coalesce(na.balance, 0) as "nationDracoBalance",
-        coalesce(ka.balance, 0) as "kingdomDracoBalance",
-        coalesce(i.inventory_json, '[]'::jsonb) as inventory,
-        coalesce(i.armor_json, '[]'::jsonb) as armor,
-        coalesce(i.ender_chest_json, '[]'::jsonb) as "enderChest",
-        coalesce(i.offhand_json, '{}'::jsonb) as offhand,
-        coalesce(i.hotbar_slot, 0) as "hotbarSlot",
-        coalesce(i.experience_level, 0) as "experienceLevel",
-        coalesce(i.total_experience, 0) as "totalExperience",
-        coalesce(i.health, 20) as health,
-        coalesce(i.hunger, 20) as hunger,
-        coalesce(i.saturation, 5) as saturation,
-        coalesce(i.inventory_version, 0) as "inventoryVersion"
-      from players p
-      left join nation_memberships nm
-        on nm.player_id = p.id
-       and nm.left_at is null
-      left join nations n
-        on n.id = nm.nation_id
-      left join kingdoms k
-        on k.id = n.kingdom_id
-      left join clan_memberships cm
-        on cm.player_id = p.id
-       and cm.left_at is null
-      left join clans c
-        on c.id = cm.clan_id
-      left join accounts a
-        on a.player_id = p.id
-       and a.currency_code = 'DRACO'
-      left join accounts na
-        on na.nation_id = n.id
-       and na.currency_code = 'DRACO'
-      left join accounts ka
-        on ka.kingdom_id = k.id
-       and ka.currency_code = 'DRACO'
-      left join player_inventories i
-        on i.player_id = p.id
-      where p.id = $1
-      limit 1
-    `,
-    [playerId]
-  );
+  const startTime = Date.now();
 
-  return stateResult.rows[0] ?? null;
+  const [profileResult, inventoryResult] = await Promise.all([
+    client.query(
+      `
+        select
+          p.id as "playerId",
+          p.xuid,
+          p.gamertag,
+          p.race,
+          p.class_name as "className",
+          p.title,
+          n.slug as "nationSlug",
+          n.name as "nationName",
+          k.slug as "kingdomSlug",
+          k.name as "kingdomName",
+          c.id as "clanId",
+          c.name as "clanName",
+          c.tag as "clanTag",
+          coalesce(a.balance, 0) as "dracoBalance",
+          coalesce(na.balance, 0) as "nationDracoBalance",
+          coalesce(ka.balance, 0) as "kingdomDracoBalance"
+        from players p
+        left join nation_memberships nm on nm.player_id = p.id and nm.left_at is null
+        left join nations n on n.id = nm.nation_id
+        left join kingdoms k on k.id = n.kingdom_id
+        left join clan_memberships cm on cm.player_id = p.id and cm.left_at is null
+        left join clans c on c.id = cm.clan_id
+        left join accounts a on a.player_id = p.id and a.currency_code = 'DRACO'
+        left join accounts na on na.nation_id = n.id and na.currency_code = 'DRACO'
+        left join accounts ka on ka.kingdom_id = k.id and ka.currency_code = 'DRACO'
+        where p.id = $1
+        limit 1
+      `,
+      [playerId]
+    ),
+    client.query(
+      `
+        select
+          coalesce(inventory_json, '[]'::jsonb) as inventory,
+          coalesce(armor_json, '[]'::jsonb) as armor,
+          coalesce(ender_chest_json, '[]'::jsonb) as "enderChest",
+          coalesce(offhand_json, '{}'::jsonb) as offhand,
+          coalesce(hotbar_slot, 0) as "hotbarSlot",
+          coalesce(experience_level, 0) as "experienceLevel",
+          coalesce(total_experience, 0) as "totalExperience",
+          coalesce(health, 20) as health,
+          coalesce(hunger, 20) as hunger,
+          coalesce(saturation, 5) as saturation,
+          coalesce(inventory_version, 0) as "inventoryVersion"
+        from player_inventories
+        where player_id = $1
+        limit 1
+      `,
+      [playerId]
+    )
+  ]);
+
+  const duration = Date.now() - startTime;
+  if (duration > 500) {
+    console.warn(`[PERF] loadPlayerState took ${duration}ms for player ${playerId}`);
+  }
+
+  const profile = profileResult.rows[0] ?? null;
+  if (!profile) return null;
+
+  const inventory = inventoryResult.rows[0] ?? {
+    inventory: [],
+    armor: [],
+    enderChest: [],
+    offhand: {},
+    hotbarSlot: 0,
+    experienceLevel: 0,
+    totalExperience: 0,
+    health: 20,
+    hunger: 20,
+    saturation: 5,
+    inventoryVersion: 0
+  };
+
+  const row = { ...profile, ...inventory };
+
+  return row;
 }
 
 export async function handleJoin(payload: JoinPayload) {
@@ -227,6 +250,10 @@ export async function handleJoin(payload: JoinPayload) {
 
     const serverId = await findServerId(client, payload.serverSlug);
     const playerId = await ensurePlayer(client, payload);
+    
+    // [DIAGNÓSTICO CRÍTICO]
+    console.warn(`[DEBUG_JOIN] USER_CONNECTED: GT=${payload.gamertag}, XUID=${payload.xuid}, PID=${playerId}`);
+
     await ensurePlayerAccount(client, playerId);
 
     await client.query(

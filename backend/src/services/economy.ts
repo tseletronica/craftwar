@@ -1,7 +1,9 @@
 import { PoolClient } from "pg";
 import { z } from "zod";
 
+import { config } from "../config.js";
 import { pool } from "../lib/db.js";
+import { isAdmin } from "./admin.js";
 
 export const transferPayloadSchema = z.object({
   xuid: z.string().min(1),
@@ -13,7 +15,18 @@ export const transferPayloadSchema = z.object({
   reason: z.string().trim().max(120).optional()
 });
 
+export const mintPayloadSchema = z.object({
+  xuid: z.string().min(1),
+  gamertag: z.string().min(1),
+  serverSlug: z.string().min(1),
+  legacyXuids: z.array(z.string().min(1)).default([]),
+  targetGamertag: z.string().min(1),
+  amount: z.number().int().positive(),
+  reason: z.string().trim().max(50).optional()
+});
+
 type TransferPayload = z.infer<typeof transferPayloadSchema>;
+type MintPayload = z.infer<typeof mintPayloadSchema>;
 
 type PlayerIdentityRow = {
   id: string;
@@ -243,24 +256,28 @@ export async function transferDraco(payload: TransferPayload) {
     const senderBalance = BigInt(senderAccount.balance);
     const recipientBalance = BigInt(recipientAccount.balance);
 
-    if (senderBalance < transferAmount) {
+    const isSenderAdmin = isAdmin(payload.gamertag, payload.xuid);
+
+    if (!isSenderAdmin && senderBalance < transferAmount) {
       throw createEconomyError(409, "insufficient_funds", "Insufficient funds.", {
         currentBalance: toSafeNumber(senderBalance)
       });
     }
 
-    const nextSenderBalance = senderBalance - transferAmount;
+    const nextSenderBalance = isSenderAdmin ? senderBalance : senderBalance - transferAmount;
     const nextRecipientBalance = recipientBalance + transferAmount;
 
-    await client.query(
-      `
-        update accounts
-        set balance = $2,
-            updated_at = now()
-        where id = $1
-      `,
-      [senderAccount.id, nextSenderBalance.toString()]
-    );
+    if (!isSenderAdmin) {
+      await client.query(
+        `
+          update accounts
+          set balance = $2,
+              updated_at = now()
+          where id = $1
+        `,
+        [senderAccount.id, nextSenderBalance.toString()]
+      );
+    }
 
     await client.query(
       `
@@ -320,4 +337,124 @@ export async function transferDraco(payload: TransferPayload) {
   } finally {
     client.release();
   }
+}
+
+export async function mintDraco(payload: MintPayload) {
+  const client = await pool.connect();
+
+  try {
+    await client.query("begin");
+
+    // Verificar se quem está pedindo é Admin
+    if (!isAdmin(payload.gamertag, payload.xuid)) {
+      throw createEconomyError(403, "forbidden", "Only admins can mint Dracos.");
+    }
+
+    const serverId = await findServerId(client, payload.serverSlug);
+    const actorId = await ensurePlayer(client, payload);
+    const recipient = await findPlayerByGamertag(client, payload.targetGamertag);
+
+    if (!recipient) {
+      throw createEconomyError(
+        404,
+        "recipient_not_found",
+        `Player ${payload.targetGamertag} was not found.`
+      );
+    }
+
+    await ensurePlayerAccount(client, recipient.id);
+
+    const accountsByPlayerId = await lockPlayerAccounts(client, [recipient.id]);
+    const recipientAccount = accountsByPlayerId.get(recipient.id);
+
+    if (!recipientAccount) {
+      throw createEconomyError(500, "account_not_found", "Unable to load recipient account.");
+    }
+
+    const mintAmount = BigInt(payload.amount);
+    const recipientBalance = BigInt(recipientAccount.balance);
+    const nextRecipientBalance = recipientBalance + mintAmount;
+
+    await client.query(
+      `
+        update accounts
+        set balance = $2,
+            updated_at = now()
+        where id = $1
+      `,
+      [recipientAccount.id, nextRecipientBalance.toString()]
+    );
+
+    const transactionResult = await client.query<{ id: string }>(
+      `
+        insert into draco_transactions (
+          to_account_id,
+          amount,
+          transaction_type,
+          status,
+          reason,
+          metadata,
+          created_by_player_id,
+          server_id
+        )
+        values (
+          $1, $2, 'mint', 'confirmed', $3, $4::jsonb, $5, $6
+        )
+        returning id
+      `,
+      [
+        recipientAccount.id,
+        mintAmount.toString(),
+        payload.reason?.trim() || "admin_mint",
+        JSON.stringify({
+          adminGamertag: payload.gamertag,
+          recipientGamertag: recipient.gamertag,
+          source: "admin_command"
+        }),
+        actorId,
+        serverId
+      ]
+    );
+
+    await client.query("commit");
+
+    return {
+      transactionId: transactionResult.rows[0].id,
+      amount: toSafeNumber(mintAmount),
+      recipientBalance: toSafeNumber(nextRecipientBalance),
+      recipientGamertag: recipient.gamertag
+    };
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Busca os jogadores com os maiores saldos de Dracos.
+ */
+export async function getTopRicos(limit: number = 10) {
+  const adminGamertags = config.ADMIN_COMMAND_GAMERTAGS;
+
+  const accountResult = await pool.query<{ gamertag: string; balance: string }>(
+    `
+      select
+        p.gamertag,
+        a.balance
+      from accounts a
+      inner join players p on p.id = a.player_id
+      where a.currency_code = 'DRACO'
+        and not (lower(p.gamertag) = any($2::text[]))
+      order by (a.balance)::numeric desc
+      limit $1
+    `,
+    [limit, adminGamertags.map(g => g.toLowerCase())]
+  );
+
+  return accountResult.rows.map(row => ({
+    gamertag: row.gamertag,
+    balance: Number(row.balance)
+  }));
 }
