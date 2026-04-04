@@ -630,6 +630,10 @@ function registerCombatHooks() {
   }
 
   world.beforeEvents.entityHurt.subscribe((event) => {
+    if (event.cancel) {
+      return;
+    }
+
     const victim = event.hurtEntity;
     const attacker = event.damageSource?.damagingEntity;
     const cause = event.damageSource?.cause;
@@ -762,6 +766,10 @@ function registerCombatHooks() {
 function registerBuilderHooks() {
   if (world.beforeEvents.playerBreakBlock) {
     world.beforeEvents.playerBreakBlock.subscribe((event) => {
+      if (event.cancel) {
+        return;
+      }
+
       const player = event.player;
       if (!isValidPlayer(player)) {
         return;
@@ -847,6 +855,10 @@ function registerBuilderHooks() {
 
   if (world.beforeEvents.playerPlaceBlock) {
     world.beforeEvents.playerPlaceBlock.subscribe((event) => {
+      if (event.cancel) {
+        return;
+      }
+
       const player = event.player;
       if (!isValidPlayer(player)) {
         return;

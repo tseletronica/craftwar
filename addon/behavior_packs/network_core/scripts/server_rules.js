@@ -1,10 +1,17 @@
 import { CommandPermissionLevel, GameMode, system, world } from '@minecraft/server';
 import { NETWORK_CONFIG } from './config.js';
+import { getCachedBundle } from './player_sync.js';
 
 const CREATIVE_MODE = GameMode.Creative ?? GameMode.creative ?? 'creative';
 const SURVIVAL_MODE = GameMode.Survival ?? GameMode.survival ?? 'survival';
+const ADVENTURE_MODE = GameMode.Adventure ?? GameMode.adventure ?? 'adventure';
 const ADMIN_COMMAND_LEVEL =
   CommandPermissionLevel.Admin ?? CommandPermissionLevel.GameDirectors ?? 2;
+const NATION_SERVER_SLUGS = new Set(['fire', 'water', 'earth', 'air']);
+const GAMERULE_REAPPLY_INTERVAL_TICKS = 600;
+const MODE_ENFORCEMENT_INTERVAL_TICKS = 40;
+const ACTION_NOTICE_COOLDOWN_MS = 4000;
+const actionNoticeCooldowns = new Map();
 
 const adminGamertags = new Set(
   NETWORK_CONFIG.adminCreativeGamertags.map((entry) => normalizeName(entry))
@@ -40,6 +47,10 @@ function isSurvivalGameMode(value) {
   return String(value ?? '').trim().toLowerCase() === String(SURVIVAL_MODE).trim().toLowerCase();
 }
 
+function isAdventureGameMode(value) {
+  return String(value ?? '').trim().toLowerCase() === String(ADVENTURE_MODE).trim().toLowerCase();
+}
+
 function isValidPlayer(player) {
   try {
     if (!player) {
@@ -61,6 +72,82 @@ function send(player, message) {
     player.sendMessage(message);
   } catch (error) {
   }
+}
+
+function sendThrottled(player, key, message, cooldownMs = ACTION_NOTICE_COOLDOWN_MS) {
+  if (!isValidPlayer(player)) {
+    return;
+  }
+
+  const now = Date.now();
+  const mapKey = `${player.id}:${key}`;
+  const nextAllowedAt = actionNoticeCooldowns.get(mapKey) || 0;
+  if (now < nextAllowedAt) {
+    return;
+  }
+
+  actionNoticeCooldowns.set(mapKey, now + cooldownMs);
+  send(player, message);
+}
+
+function getProtectedNationServerSlug() {
+  const serverSlug = normalizeName(NETWORK_CONFIG.serverSlug);
+  return NATION_SERVER_SLUGS.has(serverSlug) ? serverSlug : null;
+}
+
+function getPlayerNationSlug(player) {
+  return normalizeName(getCachedBundle(player)?.profile?.nationSlug);
+}
+
+function isVisitorInProtectedNation(player) {
+  const protectedNationSlug = getProtectedNationServerSlug();
+  if (!protectedNationSlug || !isValidPlayer(player) || isCreativeGamertag(player)) {
+    return false;
+  }
+
+  return getPlayerNationSlug(player) !== protectedNationSlug;
+}
+
+function trySetGameMode(player, targetMode) {
+  try {
+    player.setGameMode(targetMode);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+function tryRunWorldCommand(command) {
+  const overworld = world.getDimension('overworld');
+
+  try {
+    if (typeof overworld?.runCommandAsync === 'function') {
+      overworld.runCommandAsync(command).catch(() => {});
+      return true;
+    }
+  } catch (error) {
+  }
+
+  try {
+    if (typeof overworld?.runCommand === 'function') {
+      overworld.runCommand(command);
+      return true;
+    }
+  } catch (error) {
+  }
+
+  return false;
+}
+
+function enforceNationProtectionGamerules() {
+  if (!getProtectedNationServerSlug()) {
+    return;
+  }
+
+  tryRunWorldCommand('gamerule keepinventory true');
+  tryRunWorldCommand('gamerule mobgriefing false');
+  tryRunWorldCommand('gamerule tntexplodes false');
+  tryRunWorldCommand('gamerule dofiretick false');
 }
 
 function toCenteredLocation(location, fallbackY = 80) {
@@ -187,23 +274,63 @@ function enforceCreativeAdmin(player, notify = false) {
   }
 }
 
-function enforceSurvivalForNonAdmins(player, notify = false) {
-  if (!isValidPlayer(player) || isCreativeGamertag(player)) {
+function enforceProtectedNationMode(player, notify = false) {
+  if (!isValidPlayer(player) || isCreativeGamertag(player) || !getProtectedNationServerSlug()) {
+    return;
+  }
+
+  if (isVisitorInProtectedNation(player)) {
+    if (!isAdventureGameMode(player.getGameMode?.()) && trySetGameMode(player, ADVENTURE_MODE) && notify) {
+      sendThrottled(
+        player,
+        'protected_nation_adventure',
+        '\u00a7e[PROTECAO] Visitantes ficam em modo aventura dentro desta nacao.'
+      );
+    }
     return;
   }
 
   try {
-    if (!isSurvivalGameMode(player.getGameMode?.())) {
-      player.setGameMode(SURVIVAL_MODE);
-      if (notify) {
-        send(player, '\u00a7e[NETWORK] Seu modo de jogo foi redefinido para sobreviv\u00eancia.');
-      }
+    if (!isSurvivalGameMode(player.getGameMode?.()) && trySetGameMode(player, SURVIVAL_MODE) && notify) {
+      sendThrottled(
+        player,
+        'protected_nation_survival',
+        '\u00a7a[PROTECAO] Nativos desta nacao jogam em sobrevivencia aqui.'
+      );
     }
   } catch (error) {
     if (notify) {
       send(player, '\u00a7c[NETWORK] N\u00e3o foi poss\u00edvel redefinir seu modo de jogo.');
     }
   }
+}
+
+function enforceSurvivalForNonAdmins(player, notify = false) {
+  if (!isValidPlayer(player) || isCreativeGamertag(player)) {
+    return;
+  }
+
+  if (!isSurvivalGameMode(player.getGameMode?.()) && trySetGameMode(player, SURVIVAL_MODE) && notify) {
+    send(player, '\u00a7e[NETWORK] Seu modo de jogo foi redefinido para sobreviv\u00eancia.');
+  }
+}
+
+function enforcePlayerModeRules(player, notify = false) {
+  if (!isValidPlayer(player)) {
+    return;
+  }
+
+  if (isCreativeGamertag(player)) {
+    enforceCreativeAdmin(player, notify);
+    return;
+  }
+
+  if (getProtectedNationServerSlug()) {
+    enforceProtectedNationMode(player, notify);
+    return;
+  }
+
+  enforceSurvivalForNonAdmins(player, notify);
 }
 
 function enforceDimensionRestrictions(player, preferredDimension, preferredLocation) {
@@ -221,12 +348,84 @@ function enforceDimensionRestrictions(player, preferredDimension, preferredLocat
   }
 }
 
+function cancelVisitorAction(eventPlayer, messageKey, messageText) {
+  if (!isVisitorInProtectedNation(eventPlayer)) {
+    return false;
+  }
+
+  sendThrottled(eventPlayer, messageKey, messageText);
+  return true;
+}
+
+function registerProtectedNationHooks() {
+  if (!getProtectedNationServerSlug()) {
+    return;
+  }
+
+  if (world.beforeEvents.entityHurt) {
+    world.beforeEvents.entityHurt.subscribe((event) => {
+      const attacker = event.damageSource?.damagingEntity;
+      if (!isValidPlayer(attacker)) {
+        return;
+      }
+
+      if (!cancelVisitorAction(attacker, 'visitor_damage', '\u00a7c[PROTECAO] Visitantes nao podem causar dano nesta nacao.')) {
+        return;
+      }
+
+      event.cancel = true;
+    });
+  }
+
+  if (world.beforeEvents.playerBreakBlock) {
+    world.beforeEvents.playerBreakBlock.subscribe((event) => {
+      if (!cancelVisitorAction(event.player, 'visitor_break', '\u00a7c[PROTECAO] Visitantes nao podem quebrar blocos nesta nacao.')) {
+        return;
+      }
+
+      event.cancel = true;
+    });
+  }
+
+  if (world.beforeEvents.playerPlaceBlock) {
+    world.beforeEvents.playerPlaceBlock.subscribe((event) => {
+      if (!cancelVisitorAction(event.player, 'visitor_place', '\u00a7c[PROTECAO] Visitantes nao podem colocar blocos nesta nacao.')) {
+        return;
+      }
+
+      event.cancel = true;
+    });
+  }
+
+  if (world.beforeEvents.playerInteractWithBlock) {
+    world.beforeEvents.playerInteractWithBlock.subscribe((event) => {
+      if (!cancelVisitorAction(event.player, 'visitor_interact_block', '\u00a7c[PROTECAO] Visitantes nao podem interagir com blocos nesta nacao.')) {
+        return;
+      }
+
+      event.cancel = true;
+    });
+  }
+
+  if (world.beforeEvents.playerInteractWithEntity) {
+    world.beforeEvents.playerInteractWithEntity.subscribe((event) => {
+      if (!cancelVisitorAction(event.player, 'visitor_interact_entity', '\u00a7c[PROTECAO] Visitantes nao podem interagir com entidades nesta nacao.')) {
+        return;
+      }
+
+      event.cancel = true;
+    });
+  }
+}
+
 export function initializeServerRules() {
+  enforceNationProtectionGamerules();
+  registerProtectedNationHooks();
+
   world.afterEvents.playerSpawn.subscribe((event) => {
     system.run(() => {
       const player = event.player;
-      enforceCreativeAdmin(player);
-      enforceSurvivalForNonAdmins(player);
+      enforcePlayerModeRules(player);
       enforceDimensionRestrictions(player);
     });
   });
@@ -234,16 +433,7 @@ export function initializeServerRules() {
   if (world.afterEvents.playerGameModeChange) {
     world.afterEvents.playerGameModeChange.subscribe((event) => {
       system.run(() => {
-        if (isCreativeGamertag(event.player)) {
-          if (!isCreativeGameMode(event.toGameMode)) {
-            enforceCreativeAdmin(event.player, true);
-          }
-          return;
-        }
-
-        if (isCreativeGameMode(event.toGameMode)) {
-          enforceSurvivalForNonAdmins(event.player, true);
-        }
+        enforcePlayerModeRules(event.player, true);
       });
     });
   }
@@ -264,4 +454,18 @@ export function initializeServerRules() {
       });
     });
   }
+
+  system.runInterval(() => {
+    for (const player of world.getAllPlayers()) {
+      if (!isValidPlayer(player)) {
+        continue;
+      }
+
+      enforcePlayerModeRules(player);
+    }
+  }, MODE_ENFORCEMENT_INTERVAL_TICKS);
+
+  system.runInterval(() => {
+    enforceNationProtectionGamerules();
+  }, GAMERULE_REAPPLY_INTERVAL_TICKS);
 }
