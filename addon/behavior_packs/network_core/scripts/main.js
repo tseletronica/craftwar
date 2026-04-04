@@ -566,12 +566,18 @@ function sendLoginSummary(player, bundle) {
   send(player, `\u00a77Nacao: \u00a7b${nationName} \u00a78| \u00a77Classe: \u00a76${className}`);
 }
 
+function waitTicks(ticks) {
+  return new Promise((resolve) => {
+    system.runTimeout(resolve, Math.max(1, Number(ticks) || 1));
+  });
+}
+
 async function handleAsyncPlayerJoin(event) {
   if (!event.isValid()) {
     return;
   }
 
-  rememberPersistentIdentity(event.playerName, event.persistentId);
+  rememberPersistentIdentity(event.name ?? event.playerName, event.persistentId);
 }
 
 system.run(() => {
@@ -593,7 +599,16 @@ world.afterEvents.playerSpawn.subscribe((event) => {
     }
 
     send(player, '\u00a7a[NETWORK] Sincronizando perfil compartilhado...');
-    const result = await connectPlayer(player);
+    let result = await connectPlayer(player);
+    for (let attempt = 0; attempt < 3 && !result.ok && result.error === 'missing_persistent_id'; attempt += 1) {
+      await waitTicks(40);
+      if (!isPlayerValid(player)) {
+        return;
+      }
+
+      result = await connectPlayer(player);
+    }
+
     if (!result.ok) {
       send(player, `\u00a7c[NETWORK] Falha ao carregar seu perfil compartilhado: ${result.error}`);
       return;

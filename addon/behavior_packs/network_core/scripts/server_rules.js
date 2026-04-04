@@ -2,6 +2,7 @@ import { CommandPermissionLevel, GameMode, system, world } from '@minecraft/serv
 import { NETWORK_CONFIG } from './config.js';
 
 const CREATIVE_MODE = GameMode.Creative ?? GameMode.creative ?? 'creative';
+const SURVIVAL_MODE = GameMode.Survival ?? GameMode.survival ?? 'survival';
 const ADMIN_COMMAND_LEVEL =
   CommandPermissionLevel.Admin ?? CommandPermissionLevel.GameDirectors ?? 2;
 
@@ -33,6 +34,10 @@ function isCreativeGamertag(player) {
 
 function isCreativeGameMode(value) {
   return String(value ?? '').trim().toLowerCase() === String(CREATIVE_MODE).trim().toLowerCase();
+}
+
+function isSurvivalGameMode(value) {
+  return String(value ?? '').trim().toLowerCase() === String(SURVIVAL_MODE).trim().toLowerCase();
 }
 
 function isValidPlayer(player) {
@@ -182,6 +187,25 @@ function enforceCreativeAdmin(player, notify = false) {
   }
 }
 
+function enforceSurvivalForNonAdmins(player, notify = false) {
+  if (!isValidPlayer(player) || isCreativeGamertag(player)) {
+    return;
+  }
+
+  try {
+    if (!isSurvivalGameMode(player.getGameMode?.())) {
+      player.setGameMode(SURVIVAL_MODE);
+      if (notify) {
+        send(player, '\u00a7e[NETWORK] Seu modo de jogo foi redefinido para sobreviv\u00eancia.');
+      }
+    }
+  } catch (error) {
+    if (notify) {
+      send(player, '\u00a7c[NETWORK] N\u00e3o foi poss\u00edvel redefinir seu modo de jogo.');
+    }
+  }
+}
+
 function enforceDimensionRestrictions(player, preferredDimension, preferredLocation) {
   if (NETWORK_CONFIG.allowExtraDimensions || !isValidPlayer(player)) {
     return;
@@ -202,18 +226,24 @@ export function initializeServerRules() {
     system.run(() => {
       const player = event.player;
       enforceCreativeAdmin(player);
+      enforceSurvivalForNonAdmins(player);
       enforceDimensionRestrictions(player);
     });
   });
 
   if (world.afterEvents.playerGameModeChange) {
     world.afterEvents.playerGameModeChange.subscribe((event) => {
-      if (!isCreativeGamertag(event.player) || isCreativeGameMode(event.toGameMode)) {
-        return;
-      }
-
       system.run(() => {
-        enforceCreativeAdmin(event.player, true);
+        if (isCreativeGamertag(event.player)) {
+          if (!isCreativeGameMode(event.toGameMode)) {
+            enforceCreativeAdmin(event.player, true);
+          }
+          return;
+        }
+
+        if (isCreativeGameMode(event.toGameMode)) {
+          enforceSurvivalForNonAdmins(event.player, true);
+        }
       });
     });
   }

@@ -1,9 +1,11 @@
-import { EquipmentSlot, ItemStack } from '@minecraft/server';
+import { EquipmentSlot, ItemStack, system } from '@minecraft/server';
 import { NETWORK_CONFIG } from './config.js';
 import { requestJson } from './bridge_client.js';
 
 const bundleCache = new Map();
 const persistentIdentityCache = new Map();
+const PERSISTENT_ID_RETRY_TICKS = 5;
+const PERSISTENT_ID_MAX_RETRIES = 8;
 
 const ARMOR_SLOT_MAP = {
   head: EquipmentSlot.Head,
@@ -14,6 +16,14 @@ const ARMOR_SLOT_MAP = {
 
 function normalizeName(value) {
   return String(value || '').trim().toLowerCase();
+}
+
+function readPlayerName(player) {
+  try {
+    return String(player?.name || '').trim();
+  } catch (error) {
+    return '';
+  }
 }
 
 export function rememberPersistentIdentity(playerName, persistentId) {
@@ -28,19 +38,36 @@ export function rememberPersistentIdentity(playerName, persistentId) {
 }
 
 function getPlayerIdentity(player) {
-  const gamertag = String(player?.name || '').trim();
+  const gamertag = readPlayerName(player);
   const legacyNameIdentity = normalizeName(gamertag);
   const persistentId = persistentIdentityCache.get(legacyNameIdentity) || '';
 
   return {
-    xuid: persistentId || legacyNameIdentity,
+    xuid: persistentId,
     gamertag,
     legacyXuids:
       persistentId && legacyNameIdentity && persistentId !== legacyNameIdentity
         ? [legacyNameIdentity]
         : [],
-    identitySource: persistentId ? 'persistentId' : 'gamertag'
+    identitySource: persistentId ? 'persistentId' : 'pendingPersistentId'
   };
+}
+
+function waitTicks(ticks) {
+  return new Promise((resolve) => {
+    system.runTimeout(resolve, Math.max(1, Number(ticks) || 1));
+  });
+}
+
+async function resolvePlayerIdentity(player) {
+  let identity = getPlayerIdentity(player);
+
+  for (let attempt = 0; attempt < PERSISTENT_ID_MAX_RETRIES && !identity.xuid; attempt += 1) {
+    await waitTicks(PERSISTENT_ID_RETRY_TICKS);
+    identity = getPlayerIdentity(player);
+  }
+
+  return identity;
 }
 
 function readErrorCode(response) {
@@ -284,9 +311,9 @@ export async function heartbeatServerPresence() {
 }
 
 export async function connectPlayer(player) {
-  const identity = getPlayerIdentity(player);
+  const identity = await resolvePlayerIdentity(player);
   if (!identity.xuid) {
-    return { ok: false, error: 'invalid_player_id' };
+    return { ok: false, error: 'missing_persistent_id' };
   }
 
   const response = await requestJson('POST', '/internal/player-sync/join', {
@@ -306,9 +333,9 @@ export async function connectPlayer(player) {
 }
 
 export async function reloadPlayerBundle(player) {
-  const identity = getPlayerIdentity(player);
+  const identity = await resolvePlayerIdentity(player);
   if (!identity.xuid) {
-    return { ok: false, error: 'invalid_player_id' };
+    return { ok: false, error: 'missing_persistent_id' };
   }
 
   const response = await requestJson('POST', '/internal/player-sync/state', {
@@ -333,9 +360,9 @@ export async function heartbeatPlayer(player) {
 }
 
 export async function savePlayerState(player) {
-  const identity = getPlayerIdentity(player);
+  const identity = await resolvePlayerIdentity(player);
   if (!identity.xuid) {
-    return { ok: false, error: 'invalid_player_id' };
+    return { ok: false, error: 'missing_persistent_id' };
   }
 
   const inventoryState = serializeInventory(player, identity.identitySource);
@@ -393,7 +420,7 @@ export async function savePlayerState(player) {
 }
 
 export async function disconnectPlayer(player) {
-  const identity = getPlayerIdentity(player);
+  const identity = await resolvePlayerIdentity(player);
   if (!identity.xuid) {
     return { ok: true };
   }
@@ -415,9 +442,9 @@ export async function disconnectPlayer(player) {
 }
 
 export async function transferBalance(player, targetGamertag, amount) {
-  const identity = getPlayerIdentity(player);
+  const identity = await resolvePlayerIdentity(player);
   if (!identity.xuid) {
-    return { ok: false, error: 'invalid_player_id' };
+    return { ok: false, error: 'missing_persistent_id' };
   }
 
   const normalizedTargetGamertag = String(targetGamertag || '').trim();
@@ -461,9 +488,9 @@ export async function transferBalance(player, targetGamertag, amount) {
 }
 
 export async function mintBalance(player, targetGamertag, amount) {
-  const identity = getPlayerIdentity(player);
+  const identity = await resolvePlayerIdentity(player);
   if (!identity.xuid) {
-    return { ok: false, error: 'invalid_player_id' };
+    return { ok: false, error: 'missing_persistent_id' };
   }
 
   const normalizedTargetGamertag = String(targetGamertag || '').trim();
@@ -523,9 +550,9 @@ export async function getTopRicos() {
 }
 
 export async function chooseNation(player, nationSlug) {
-  const identity = getPlayerIdentity(player);
+  const identity = await resolvePlayerIdentity(player);
   if (!identity.xuid) {
-    return { ok: false, error: 'invalid_player_id' };
+    return { ok: false, error: 'missing_persistent_id' };
   }
 
   const response = await requestJson('POST', '/internal/nations/select', {
@@ -555,9 +582,9 @@ export async function chooseNation(player, nationSlug) {
 }
 
 export async function promoteNationMember(player, targetGamertag, className) {
-  const identity = getPlayerIdentity(player);
+  const identity = await resolvePlayerIdentity(player);
   if (!identity.xuid) {
-    return { ok: false, error: 'invalid_player_id' };
+    return { ok: false, error: 'missing_persistent_id' };
   }
 
   const response = await requestJson('POST', '/internal/nations/promote', {
@@ -587,9 +614,9 @@ export async function promoteNationMember(player, targetGamertag, className) {
 }
 
 export async function demoteNationMember(player, targetGamertag) {
-  const identity = getPlayerIdentity(player);
+  const identity = await resolvePlayerIdentity(player);
   if (!identity.xuid) {
-    return { ok: false, error: 'invalid_player_id' };
+    return { ok: false, error: 'missing_persistent_id' };
   }
 
   const response = await requestJson('POST', '/internal/nations/demote', {
@@ -617,9 +644,9 @@ export async function demoteNationMember(player, targetGamertag) {
 }
 
 export async function expelNationMember(player, targetGamertag) {
-  const identity = getPlayerIdentity(player);
+  const identity = await resolvePlayerIdentity(player);
   if (!identity.xuid) {
-    return { ok: false, error: 'invalid_player_id' };
+    return { ok: false, error: 'missing_persistent_id' };
   }
 
   const response = await requestJson('POST', '/internal/nations/expel', {

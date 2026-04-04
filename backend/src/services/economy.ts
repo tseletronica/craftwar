@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import { config } from "../config.js";
 import { pool } from "../lib/db.js";
+import { rejectGamertagFallbackXuid } from "../lib/player-identity.js";
 import { isAdmin } from "./admin.js";
 
 export const transferPayloadSchema = z.object({
@@ -13,7 +14,7 @@ export const transferPayloadSchema = z.object({
   targetGamertag: z.string().min(1),
   amount: z.number().int().positive(),
   reason: z.string().trim().max(120).optional()
-});
+}).superRefine(rejectGamertagFallbackXuid);
 
 export const mintPayloadSchema = z.object({
   xuid: z.string().min(1),
@@ -23,7 +24,7 @@ export const mintPayloadSchema = z.object({
   targetGamertag: z.string().min(1),
   amount: z.number().int().positive(),
   reason: z.string().trim().max(50).optional()
-});
+}).superRefine(rejectGamertagFallbackXuid);
 
 type TransferPayload = z.infer<typeof transferPayloadSchema>;
 type MintPayload = z.infer<typeof mintPayloadSchema>;

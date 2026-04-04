@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import { config } from "../config.js";
 import { pool } from "../lib/db.js";
+import { rejectGamertagFallbackXuid } from "../lib/player-identity.js";
 import { loadPlayerState } from "./player-sync.js";
 
 const actorIdentitySchema = {
@@ -15,23 +16,23 @@ const actorIdentitySchema = {
 export const chooseNationPayloadSchema = z.object({
   ...actorIdentitySchema,
   nationSlug: z.string().min(1)
-});
+}).superRefine(rejectGamertagFallbackXuid);
 
 export const promoteMemberPayloadSchema = z.object({
   ...actorIdentitySchema,
   targetGamertag: z.string().min(1),
   className: z.string().min(1)
-});
+}).superRefine(rejectGamertagFallbackXuid);
 
 export const demoteMemberPayloadSchema = z.object({
   ...actorIdentitySchema,
   targetGamertag: z.string().min(1)
-});
+}).superRefine(rejectGamertagFallbackXuid);
 
 export const expelMemberPayloadSchema = z.object({
   ...actorIdentitySchema,
   targetGamertag: z.string().min(1)
-});
+}).superRefine(rejectGamertagFallbackXuid);
 
 type ChooseNationPayload = z.infer<typeof chooseNationPayloadSchema>;
 type PromoteMemberPayload = z.infer<typeof promoteMemberPayloadSchema>;

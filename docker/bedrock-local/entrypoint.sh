@@ -34,6 +34,7 @@ install_network_core() {
     return
   fi
 
+  rm -rf "$PACK_DIR"
   mkdir -p "$PACK_DIR"
   cp -a "$ADDON_DIR"/. "$PACK_DIR"/
 }

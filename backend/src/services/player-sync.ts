@@ -2,6 +2,7 @@ import { PoolClient } from "pg";
 import { z } from "zod";
 
 import { pool } from "../lib/db.js";
+import { rejectGamertagFallbackXuid } from "../lib/player-identity.js";
 import { isAdmin } from "./admin.js";
 
 export const joinPayloadSchema = z.object({
@@ -9,7 +10,7 @@ export const joinPayloadSchema = z.object({
   gamertag: z.string().min(1),
   serverSlug: z.string().min(1),
   legacyXuids: z.array(z.string().min(1)).default([])
-});
+}).superRefine(rejectGamertagFallbackXuid);
 
 export const inventoryPayloadSchema = z.object({
   xuid: z.string().min(1),
@@ -27,7 +28,7 @@ export const inventoryPayloadSchema = z.object({
   hunger: z.number().int().min(0).max(20).default(20),
   saturation: z.number().min(0).default(5),
   metadata: z.record(z.unknown()).default({})
-});
+}).superRefine(rejectGamertagFallbackXuid);
 
 export const leavePayloadSchema = z.object({
   xuid: z.string().min(1),
