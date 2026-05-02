@@ -187,6 +187,8 @@ create table if not exists inventory_sync_events (
 create table if not exists player_server_presence (
   player_id uuid primary key references players(id) on delete cascade,
   current_server_id uuid references game_servers(id),
+  last_server_id uuid references game_servers(id),
+  pending_transfer_server_id uuid references game_servers(id),
   online boolean not null default false,
   last_inventory_version bigint not null default 0,
   last_joined_at timestamptz,

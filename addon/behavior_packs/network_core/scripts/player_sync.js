@@ -1,11 +1,14 @@
-import { EquipmentSlot, ItemStack, system } from '@minecraft/server';
+import { EquipmentSlot, ItemStack, Potions, system } from '@minecraft/server';
 import { NETWORK_CONFIG } from './config.js';
 import { requestJson } from './bridge_client.js';
 
 const bundleCache = new Map();
 const persistentIdentityCache = new Map();
+const pendingTransferByPlayerId = new Map();
+const redirectingPlayerById = new Map();
 const PERSISTENT_ID_RETRY_TICKS = 5;
 const PERSISTENT_ID_MAX_RETRIES = 8;
+const TRANSITION_STATE_TTL_MS = 30000;
 
 const ARMOR_SLOT_MAP = {
   head: EquipmentSlot.Head,
@@ -16,6 +19,33 @@ const ARMOR_SLOT_MAP = {
 
 function normalizeName(value) {
   return String(value || '').trim().toLowerCase();
+}
+
+function normalizeServerSlug(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function isFreshTransitionEntry(entry) {
+  return Date.now() - Number(entry?.createdAt || 0) <= TRANSITION_STATE_TTL_MS;
+}
+
+function getPlayerTransitionEntry(store, player) {
+  const playerId = String(player?.id || '').trim();
+  if (!playerId) {
+    return null;
+  }
+
+  const entry = store.get(playerId) || null;
+  if (!entry) {
+    return null;
+  }
+
+  if (isFreshTransitionEntry(entry)) {
+    return entry;
+  }
+
+  store.delete(playerId);
+  return null;
 }
 
 function readPlayerName(player) {
@@ -35,6 +65,64 @@ export function rememberPersistentIdentity(playerName, persistentId) {
   }
 
   persistentIdentityCache.set(normalizedName, normalizedId);
+}
+
+export function markPlayerTransferIntent(player, destinationSlug) {
+  const playerId = String(player?.id || '').trim();
+  const normalizedDestination = normalizeServerSlug(destinationSlug);
+
+  if (!playerId || !normalizedDestination) {
+    return;
+  }
+
+  pendingTransferByPlayerId.set(playerId, {
+    destinationSlug: normalizedDestination,
+    createdAt: Date.now()
+  });
+}
+
+export function clearPlayerTransferIntent(player) {
+  const playerId = typeof player === 'string' ? player.trim() : String(player?.id || '').trim();
+  if (!playerId) {
+    return;
+  }
+
+  pendingTransferByPlayerId.delete(playerId);
+}
+
+function getPlayerTransferIntent(player) {
+  return getPlayerTransitionEntry(pendingTransferByPlayerId, player)?.destinationSlug || null;
+}
+
+export function markPlayerAwaitingRedirect(player, destinationSlug) {
+  const playerId = String(player?.id || '').trim();
+  const normalizedDestination = normalizeServerSlug(destinationSlug);
+
+  if (!playerId || !normalizedDestination) {
+    return;
+  }
+
+  redirectingPlayerById.set(playerId, {
+    destinationSlug: normalizedDestination,
+    createdAt: Date.now()
+  });
+}
+
+export function clearPlayerAwaitingRedirect(player) {
+  const playerId = typeof player === 'string' ? player.trim() : String(player?.id || '').trim();
+  if (!playerId) {
+    return;
+  }
+
+  redirectingPlayerById.delete(playerId);
+}
+
+function getPlayerAwaitingRedirect(player) {
+  return getPlayerTransitionEntry(redirectingPlayerById, player)?.destinationSlug || null;
+}
+
+export function isPlayerInTransientNetworkState(player) {
+  return Boolean(getPlayerTransferIntent(player) || getPlayerAwaitingRedirect(player));
 }
 
 function getPlayerIdentity(player) {
@@ -84,10 +172,26 @@ function serializeItem(item, extra = {}) {
     return null;
   }
 
+  let potion = null;
+  try {
+    const potionComponent = item.getComponent?.('minecraft:potion');
+    const effectTypeId = String(potionComponent?.potionEffectType?.id || '').trim();
+    const deliveryTypeId = String(potionComponent?.potionDeliveryType?.id || '').trim();
+
+    if (effectTypeId && deliveryTypeId) {
+      potion = {
+        effectTypeId,
+        deliveryTypeId
+      };
+    }
+  } catch (error) {
+  }
+
   return {
     typeId: item.typeId,
     amount: item.amount,
     nameTag: item.nameTag || null,
+    potion,
     ...extra
   };
 }
@@ -98,10 +202,39 @@ function deserializeItem(itemData) {
   }
 
   try {
-    const item = new ItemStack(itemData.typeId, Number(itemData.amount));
+    let item = null;
+    const potionEffectTypeId = String(itemData?.potion?.effectTypeId || '').trim();
+    const potionDeliveryTypeId = String(itemData?.potion?.deliveryTypeId || '').trim();
+
+    if (potionEffectTypeId && potionDeliveryTypeId) {
+      try {
+        const effectType =
+          typeof Potions.getEffectType === 'function'
+            ? (Potions.getEffectType(potionEffectTypeId) || potionEffectTypeId)
+            : potionEffectTypeId;
+        const deliveryType =
+          typeof Potions.getDeliveryType === 'function'
+            ? (Potions.getDeliveryType(potionDeliveryTypeId) || potionDeliveryTypeId)
+            : potionDeliveryTypeId;
+
+        item = Potions.resolve(effectType, deliveryType);
+        try {
+          item.amount = Number(itemData.amount);
+        } catch (error) {
+        }
+      } catch (error) {
+        item = null;
+      }
+    }
+
+    if (!item) {
+      item = new ItemStack(itemData.typeId, Number(itemData.amount));
+    }
+
     if (itemData.nameTag) {
       item.nameTag = itemData.nameTag;
     }
+
     return item;
   } catch (error) {
     return undefined;
@@ -119,11 +252,24 @@ function readHealthState(player) {
   };
 }
 
-function serializeInventory(player, identitySource) {
+function readLocationState(player) {
+  const rawLocation = player?.location || {};
+
+  return {
+    serverSlug: NETWORK_CONFIG.serverSlug,
+    dimensionId: String(player?.dimension?.id || 'minecraft:overworld'),
+    x: Number.isFinite(Number(rawLocation.x)) ? Number(rawLocation.x) : 0,
+    y: Number.isFinite(Number(rawLocation.y)) ? Number(rawLocation.y) : 0,
+    z: Number.isFinite(Number(rawLocation.z)) ? Number(rawLocation.z) : 0
+  };
+}
+
+function serializeInventory(player, identitySource, options = {}) {
   const inventoryComponent = player.getComponent('minecraft:inventory');
   const container = inventoryComponent?.container;
   const equippable = player.getComponent('minecraft:equippable');
   const healthState = readHealthState(player);
+  const transferDestinationSlug = normalizeServerSlug(options?.transferDestinationSlug) || null;
 
   const inventory = [];
   if (container) {
@@ -165,7 +311,9 @@ function serializeInventory(player, identitySource) {
     metadata: {
       savedAt: new Date().toISOString(),
       sourceServer: NETWORK_CONFIG.serverSlug,
-      identitySource
+      identitySource,
+      lastKnownLocation: readLocationState(player),
+      transferDestinationSlug
     }
   };
 }
@@ -327,9 +475,31 @@ export async function connectPlayer(player) {
     return { ok: false, error: readErrorCode(response) };
   }
 
-  const bundle = applyBundleToPlayer(player, response.data);
+  const redirect = response.data?.redirect && typeof response.data.redirect === 'object'
+    ? {
+        serverSlug: normalizeServerSlug(response.data.redirect.serverSlug),
+        serverName: String(response.data.redirect.serverName || response.data.redirect.serverSlug || '').trim(),
+        reason: String(response.data.redirect.reason || 'resume').trim()
+      }
+    : null;
 
-  return { ok: true, bundle };
+  if (redirect?.serverSlug) {
+    clearPlayerTransferIntent(player);
+    clearPlayerAwaitingRedirect(player);
+    return {
+      ok: true,
+      redirected: true,
+      redirect,
+      bundle: null
+    };
+  }
+
+  const state = response.data?.state || response.data;
+  const bundle = applyBundleToPlayer(player, state);
+  clearPlayerTransferIntent(player);
+  clearPlayerAwaitingRedirect(player);
+
+  return { ok: true, redirected: false, redirect: null, bundle };
 }
 
 export async function reloadPlayerBundle(player) {
@@ -359,18 +529,22 @@ export async function heartbeatPlayer(player) {
   };
 }
 
-export async function savePlayerState(player) {
+export async function savePlayerState(player, options = {}) {
   const identity = await resolvePlayerIdentity(player);
   if (!identity.xuid) {
     return { ok: false, error: 'missing_persistent_id' };
   }
 
-  const inventoryState = serializeInventory(player, identity.identitySource);
+  const transferDestinationSlug = normalizeServerSlug(options?.transferDestinationSlug) || null;
+  const inventoryState = serializeInventory(player, identity.identitySource, {
+    transferDestinationSlug
+  });
   const response = await requestJson('POST', '/internal/player-sync/inventory', {
     xuid: identity.xuid,
     gamertag: identity.gamertag,
     serverSlug: NETWORK_CONFIG.serverSlug,
     legacyXuids: identity.legacyXuids,
+    transferDestinationSlug,
     inventory: inventoryState.inventory,
     armor: inventoryState.armor,
     enderChest: inventoryState.enderChest,
@@ -420,20 +594,38 @@ export async function savePlayerState(player) {
 }
 
 export async function disconnectPlayer(player) {
+  const redirectDestinationSlug = getPlayerAwaitingRedirect(player);
+  if (redirectDestinationSlug) {
+    bundleCache.delete(player.id);
+    clearPlayerAwaitingRedirect(player);
+    clearPlayerTransferIntent(player);
+    return {
+      ok: true,
+      skipped: 'redirect'
+    };
+  }
+
   const identity = await resolvePlayerIdentity(player);
   if (!identity.xuid) {
+    clearPlayerTransferIntent(player);
     return { ok: true };
   }
 
-  await savePlayerState(player).catch(() => null);
+  const transferDestinationSlug = getPlayerTransferIntent(player);
+
+  if (!transferDestinationSlug) {
+    await savePlayerState(player).catch(() => null);
+  }
 
   const response = await requestJson('POST', '/internal/player-sync/leave', {
     xuid: identity.xuid,
     serverSlug: NETWORK_CONFIG.serverSlug,
-    reason: 'leave'
+    reason: transferDestinationSlug ? `transfer:${transferDestinationSlug}` : 'leave'
   });
 
   bundleCache.delete(player.id);
+  clearPlayerTransferIntent(player);
+  clearPlayerAwaitingRedirect(player);
 
   return {
     ok: response.ok,

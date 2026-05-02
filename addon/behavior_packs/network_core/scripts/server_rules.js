@@ -21,6 +21,15 @@ function normalizeName(value) {
   return String(value || '').trim().toLowerCase();
 }
 
+function normalizeText(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+}
+
 function normalizeDimensionId(value) {
   const normalized = String(value || '').trim().toLowerCase();
 
@@ -99,13 +108,58 @@ function getPlayerNationSlug(player) {
   return normalizeName(getCachedBundle(player)?.profile?.nationSlug);
 }
 
-function isVisitorInProtectedNation(player) {
-  const protectedNationSlug = getProtectedNationServerSlug();
-  if (!protectedNationSlug || !isValidPlayer(player) || isCreativeGamertag(player)) {
-    return false;
+function getPlayerRoleKey(player) {
+  const className = normalizeText(getCachedBundle(player)?.profile?.className);
+  if (!className) {
+    return null;
   }
 
-  return getPlayerNationSlug(player) !== protectedNationSlug;
+  const warriorTokens = [
+    'cacador do ceu',
+    'combat',
+    'guardiao da floresta',
+    'guerreiro',
+    'lamina de labareda',
+    'tritao'
+  ];
+  if (warriorTokens.some((token) => className.includes(token))) {
+    return 'warrior';
+  }
+
+  const builderTokens = [
+    'construtor',
+    'engenheiro de nuvens',
+    'geologo',
+    'mestre da fornalha',
+    'mestre das mares'
+  ];
+  if (builderTokens.some((token) => className.includes(token))) {
+    return 'builder';
+  }
+
+  return null;
+}
+
+function getProtectedNationAccessType(player) {
+  const protectedNationSlug = getProtectedNationServerSlug();
+  if (!protectedNationSlug || !isValidPlayer(player) || isCreativeGamertag(player)) {
+    return 'exempt';
+  }
+
+  if (getPlayerNationSlug(player) !== protectedNationSlug) {
+    return 'visitor';
+  }
+
+  const roleKey = getPlayerRoleKey(player);
+  if (roleKey === 'builder' || roleKey === 'warrior') {
+    return roleKey;
+  }
+
+  return 'citizen';
+}
+
+function isVisitorInProtectedNation(player) {
+  return getProtectedNationAccessType(player) === 'visitor';
 }
 
 function trySetGameMode(player, targetMode) {
@@ -279,12 +333,25 @@ function enforceProtectedNationMode(player, notify = false) {
     return;
   }
 
-  if (isVisitorInProtectedNation(player)) {
+  const accessType = getProtectedNationAccessType(player);
+
+  if (accessType === 'visitor') {
     if (!isAdventureGameMode(player.getGameMode?.()) && trySetGameMode(player, ADVENTURE_MODE) && notify) {
       sendThrottled(
         player,
         'protected_nation_adventure',
         '\u00a7e[PROTECAO] Visitantes ficam em modo aventura dentro desta nacao.'
+      );
+    }
+    return;
+  }
+
+  if (accessType === 'citizen') {
+    if (!isAdventureGameMode(player.getGameMode?.()) && trySetGameMode(player, ADVENTURE_MODE) && notify) {
+      sendThrottled(
+        player,
+        'protected_nation_citizen_adventure',
+        '\u00a7e[PROTECAO] Cidadaos sem classe ficam em modo aventura ate serem promovidos.'
       );
     }
     return;
@@ -348,13 +415,54 @@ function enforceDimensionRestrictions(player, preferredDimension, preferredLocat
   }
 }
 
-function cancelVisitorAction(eventPlayer, messageKey, messageText) {
-  if (!isVisitorInProtectedNation(eventPlayer)) {
+function cancelProtectedNationAction(eventPlayer, actionType, visitorKey, visitorMessage) {
+  const accessType = getProtectedNationAccessType(eventPlayer);
+  if (accessType === 'exempt') {
     return false;
   }
 
-  sendThrottled(eventPlayer, messageKey, messageText);
-  return true;
+  if (accessType === 'visitor') {
+    sendThrottled(eventPlayer, visitorKey, visitorMessage);
+    return true;
+  }
+
+  if (accessType === 'citizen') {
+    sendThrottled(
+      eventPlayer,
+      `citizen_${actionType}`,
+      '\u00a7c[PROTECAO] Cidadaos so liberam a nacao depois de serem promovidos a construtor ou guerreiro.'
+    );
+    return true;
+  }
+
+  if (actionType === 'combat' && accessType === 'builder') {
+    sendThrottled(
+      eventPlayer,
+      'builder_combat',
+      '\u00a7c[PROTECAO] Construtores nao podem lutar no mapa da nacao.'
+    );
+    return true;
+  }
+
+  if (actionType === 'build' && accessType === 'warrior') {
+    sendThrottled(
+      eventPlayer,
+      'warrior_build',
+      '\u00a7c[PROTECAO] Guerreiros nao podem alterar blocos ou estruturas da nacao.'
+    );
+    return true;
+  }
+
+  if (actionType === 'interact_entity' && accessType === 'warrior') {
+    sendThrottled(
+      eventPlayer,
+      'warrior_interact_entity',
+      '\u00a7c[PROTECAO] Guerreiros nao podem interagir com entidades protegidas da nacao.'
+    );
+    return true;
+  }
+
+  return false;
 }
 
 function registerProtectedNationHooks() {
@@ -369,7 +477,7 @@ function registerProtectedNationHooks() {
         return;
       }
 
-      if (!cancelVisitorAction(attacker, 'visitor_damage', '\u00a7c[PROTECAO] Visitantes nao podem causar dano nesta nacao.')) {
+      if (!cancelProtectedNationAction(attacker, 'combat', 'visitor_damage', '\u00a7c[PROTECAO] Visitantes nao podem causar dano nesta nacao.')) {
         return;
       }
 
@@ -379,7 +487,7 @@ function registerProtectedNationHooks() {
 
   if (world.beforeEvents.playerBreakBlock) {
     world.beforeEvents.playerBreakBlock.subscribe((event) => {
-      if (!cancelVisitorAction(event.player, 'visitor_break', '\u00a7c[PROTECAO] Visitantes nao podem quebrar blocos nesta nacao.')) {
+      if (!cancelProtectedNationAction(event.player, 'build', 'visitor_break', '\u00a7c[PROTECAO] Visitantes nao podem quebrar blocos nesta nacao.')) {
         return;
       }
 
@@ -389,7 +497,7 @@ function registerProtectedNationHooks() {
 
   if (world.beforeEvents.playerPlaceBlock) {
     world.beforeEvents.playerPlaceBlock.subscribe((event) => {
-      if (!cancelVisitorAction(event.player, 'visitor_place', '\u00a7c[PROTECAO] Visitantes nao podem colocar blocos nesta nacao.')) {
+      if (!cancelProtectedNationAction(event.player, 'build', 'visitor_place', '\u00a7c[PROTECAO] Visitantes nao podem colocar blocos nesta nacao.')) {
         return;
       }
 
@@ -399,7 +507,7 @@ function registerProtectedNationHooks() {
 
   if (world.beforeEvents.playerInteractWithBlock) {
     world.beforeEvents.playerInteractWithBlock.subscribe((event) => {
-      if (!cancelVisitorAction(event.player, 'visitor_interact_block', '\u00a7c[PROTECAO] Visitantes nao podem interagir com blocos nesta nacao.')) {
+      if (!cancelProtectedNationAction(event.player, 'interact_block', 'visitor_interact_block', '\u00a7c[PROTECAO] Visitantes nao podem interagir com blocos nesta nacao.')) {
         return;
       }
 
@@ -409,7 +517,7 @@ function registerProtectedNationHooks() {
 
   if (world.beforeEvents.playerInteractWithEntity) {
     world.beforeEvents.playerInteractWithEntity.subscribe((event) => {
-      if (!cancelVisitorAction(event.player, 'visitor_interact_entity', '\u00a7c[PROTECAO] Visitantes nao podem interagir com entidades nesta nacao.')) {
+      if (!cancelProtectedNationAction(event.player, 'interact_entity', 'visitor_interact_entity', '\u00a7c[PROTECAO] Visitantes nao podem interagir com entidades nesta nacao.')) {
         return;
       }
 

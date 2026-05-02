@@ -3,6 +3,7 @@ import { beforeEvents as adminBeforeEvents } from '@minecraft/server-admin';
 import { ActionFormData } from '@minecraft/server-ui';
 import { NETWORK_CONFIG } from './config.js';
 import {
+  clearPlayerAwaitingRedirect,
   chooseNation,
   connectPlayer,
   demoteNationMember,
@@ -10,6 +11,8 @@ import {
   expelNationMember,
   getCachedBundle,
   getTopRicos,
+  isPlayerInTransientNetworkState,
+  markPlayerAwaitingRedirect,
   mintBalance,
   promoteNationMember,
   reloadPlayerBundle,
@@ -20,7 +23,7 @@ import {
 } from './player_sync.js';
 import { initializeNationAbilities } from './nation_abilities.js';
 import { initializeServerRules } from './server_rules.js';
-import { maybeHandleTransferCommand } from './server_transfer.js';
+import { maybeHandleTransferCommand, transferPlayerToSlug } from './server_transfer.js';
 
 function send(player, message) {
   try {
@@ -157,6 +160,13 @@ const NATION_DISPLAY_NAME = {
   water: 'Nacao da Agua'
 };
 
+const NATION_NAME_TAG_COLOR = {
+  fire: '§c',
+  water: '§9',
+  air: '§e',
+  earth: '§a'
+};
+
 const NATION_SELECTION_OPTIONS = [
   {
     slug: 'fire',
@@ -191,6 +201,7 @@ const activeNationMenus = new Map();
 const PROMOTION_CLASS_ALIASES = [
   'cacador',
   'cacador do ceu',
+  'contrutor',
   'construtor',
   'engenheiro',
   'engenheiro de nuvens',
@@ -200,7 +211,9 @@ const PROMOTION_CLASS_ALIASES = [
   'geologo da terra',
   'guardiao',
   'guardiao da floresta',
+  'guereiro',
   'guerreiro',
+  'gyerreiro',
   'lamina',
   'lamina de labareda',
   'lanca',
@@ -324,6 +337,42 @@ function sendNationSelectionHint(player) {
   );
 }
 
+function getDesiredPlayerNameTag(player, bundleOverride = null) {
+  const baseName = String(player?.name || '').trim();
+  if (!baseName) {
+    return '';
+  }
+
+  const bundle = bundleOverride || getCachedBundle(player);
+  const nationSlug = String(bundle?.profile?.nationSlug || '').trim().toLowerCase();
+  const colorCode = NATION_NAME_TAG_COLOR[nationSlug] || '';
+
+  return `${colorCode}${baseName}`;
+}
+
+function applyPlayerNationNameTag(player, bundleOverride = null) {
+  if (!isPlayerValid(player)) {
+    return;
+  }
+
+  const desiredNameTag = getDesiredPlayerNameTag(player, bundleOverride);
+  if (!desiredNameTag) {
+    return;
+  }
+
+  try {
+    if (player.nameTag === desiredNameTag) {
+      return;
+    }
+  } catch (error) {
+  }
+
+  try {
+    player.nameTag = desiredNameTag;
+  } catch (error) {
+  }
+}
+
 function queueNationSelection(player) {
   if (!isPlayerValid(player)) {
     return;
@@ -376,6 +425,9 @@ async function refreshOnlinePlayerBundle(targetGamertag) {
   }
 
   const refresh = await reloadPlayerBundle(targetPlayer);
+  if (refresh.ok) {
+    applyPlayerNationNameTag(targetPlayer, refresh.bundle);
+  }
   return {
     player: targetPlayer,
     refresh
@@ -442,6 +494,7 @@ async function finalizeNationSelection(player, selectedOption) {
   const nationDisplayName =
     result.nationName || NATION_DISPLAY_NAME[result.nationSlug] || selectedOption.name || result.nationSlug;
   clearNationSelection(player);
+  applyPlayerNationNameTag(player, result.bundle);
   send(player, `\u00a7a[NACAO] Voce agora pertence a \u00a7b${nationDisplayName}\u00a7a.`);
   send(player, `\u00a77Para viajar ao seu mapa, use \u00a7f${travelCommand}\u00a77.`);
   send(player, '\u00a77Depois disso, um lord pode usar \u00a7f!promover Seu Nome Classe\u00a77 para definir sua classe.');
@@ -614,7 +667,28 @@ world.afterEvents.playerSpawn.subscribe((event) => {
       return;
     }
 
+    if (result.redirected && result.redirect?.serverSlug) {
+      markPlayerAwaitingRedirect(player, result.redirect.serverSlug);
+      send(
+        player,
+        `\u00a7e[NETWORK] Retomando sua sessao em \u00a7f${result.redirect.serverName || result.redirect.serverSlug}\u00a7e para manter seu ultimo servidor salvo.`
+      );
+
+      const redirectResult = await transferPlayerToSlug(player, result.redirect.serverSlug, {
+        saveBeforeTransfer: false,
+        markAsLoginRedirect: true,
+        showStatusMessages: false
+      });
+
+      if (!redirectResult.ok) {
+        clearPlayerAwaitingRedirect(player);
+        send(player, `\u00a7c[NETWORK] Nao foi possivel retomar sua sessao automaticamente: ${redirectResult.error}`);
+      }
+      return;
+    }
+
     const profile = result.bundle?.profile ?? {};
+    applyPlayerNationNameTag(player, result.bundle);
     sendLoginSummary(player, result.bundle);
 
     if (!String(profile.nationSlug || '').trim()) {
@@ -651,6 +725,10 @@ world.beforeEvents.playerLeave.subscribe((event) => {
 
 system.runInterval(() => {
   for (const player of world.getAllPlayers()) {
+    if (isPlayerInTransientNetworkState(player)) {
+      continue;
+    }
+
     system.run(async () => {
       await savePlayerState(player).catch(() => null);
     });
@@ -678,6 +756,12 @@ system.runInterval(() => {
     });
   }
 }, 120);
+
+system.runInterval(() => {
+  for (const player of world.getAllPlayers()) {
+    applyPlayerNationNameTag(player);
+  }
+}, 100);
 
 world.beforeEvents.chatSend.subscribe((event) => {
   const rawMessage = String(event.message || '').trim();
@@ -735,6 +819,7 @@ world.beforeEvents.chatSend.subscribe((event) => {
       const travelCommand = NATION_COMMAND_ALIAS[result.nationSlug] || '!mapas';
       const nationDisplayName = result.nationName || NATION_DISPLAY_NAME[result.nationSlug] || result.nationSlug;
       clearNationSelection(player);
+      applyPlayerNationNameTag(player, result.bundle);
       send(player, `\u00a7a[NAÇÃO] Você agora pertence a \u00a7b${nationDisplayName}\u00a7a.`);
       send(player, `\u00a77Para viajar ao seu mapa, use \u00a7f${travelCommand}\u00a77.`);
     });

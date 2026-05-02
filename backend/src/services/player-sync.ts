@@ -3,32 +3,36 @@ import { z } from "zod";
 
 import { pool } from "../lib/db.js";
 import { rejectGamertagFallbackXuid } from "../lib/player-identity.js";
-import { isAdmin } from "./admin.js";
 
-export const joinPayloadSchema = z.object({
-  xuid: z.string().min(1),
-  gamertag: z.string().min(1),
-  serverSlug: z.string().min(1),
-  legacyXuids: z.array(z.string().min(1)).default([])
-}).superRefine(rejectGamertagFallbackXuid);
+export const joinPayloadSchema = z
+  .object({
+    xuid: z.string().min(1),
+    gamertag: z.string().min(1),
+    serverSlug: z.string().min(1),
+    legacyXuids: z.array(z.string().min(1)).default([])
+  })
+  .superRefine(rejectGamertagFallbackXuid);
 
-export const inventoryPayloadSchema = z.object({
-  xuid: z.string().min(1),
-  gamertag: z.string().min(1),
-  serverSlug: z.string().min(1),
-  legacyXuids: z.array(z.string().min(1)).default([]),
-  inventory: z.array(z.unknown()).default([]),
-  armor: z.array(z.unknown()).default([]),
-  enderChest: z.array(z.unknown()).default([]),
-  offhand: z.unknown().default({}),
-  hotbarSlot: z.number().int().min(0).max(8).default(0),
-  experienceLevel: z.number().int().min(0).default(0),
-  totalExperience: z.number().int().min(0).default(0),
-  health: z.number().min(0).default(20),
-  hunger: z.number().int().min(0).max(20).default(20),
-  saturation: z.number().min(0).default(5),
-  metadata: z.record(z.unknown()).default({})
-}).superRefine(rejectGamertagFallbackXuid);
+export const inventoryPayloadSchema = z
+  .object({
+    xuid: z.string().min(1),
+    gamertag: z.string().min(1),
+    serverSlug: z.string().min(1),
+    legacyXuids: z.array(z.string().min(1)).default([]),
+    transferDestinationSlug: z.string().min(1).optional().nullable(),
+    inventory: z.array(z.unknown()).default([]),
+    armor: z.array(z.unknown()).default([]),
+    enderChest: z.array(z.unknown()).default([]),
+    offhand: z.unknown().default({}),
+    hotbarSlot: z.number().int().min(0).max(8).default(0),
+    experienceLevel: z.number().int().min(0).default(0),
+    totalExperience: z.number().int().min(0).default(0),
+    health: z.number().min(0).default(20),
+    hunger: z.number().int().min(0).max(20).default(20),
+    saturation: z.number().min(0).default(5),
+    metadata: z.record(z.unknown()).default({})
+  })
+  .superRefine(rejectGamertagFallbackXuid);
 
 export const leavePayloadSchema = z.object({
   xuid: z.string().min(1),
@@ -44,6 +48,28 @@ type JoinPayload = z.infer<typeof joinPayloadSchema>;
 type InventoryPayload = z.infer<typeof inventoryPayloadSchema>;
 type LeavePayload = z.infer<typeof leavePayloadSchema>;
 type StatePayload = z.infer<typeof statePayloadSchema>;
+
+type PresenceRow = {
+  currentServerId: string | null;
+  currentServerSlug: string | null;
+  lastServerId: string | null;
+  lastServerSlug: string | null;
+  lastServerName: string | null;
+  pendingTransferServerId: string | null;
+  pendingTransferServerSlug: string | null;
+  pendingTransferServerName: string | null;
+};
+
+type JoinRedirect = {
+  serverSlug: string;
+  serverName: string;
+  reason: "pending_transfer" | "last_server_resume";
+};
+
+type JoinResult = {
+  state: Record<string, unknown> | null;
+  redirect: JoinRedirect | null;
+};
 
 async function findServerId(client: PoolClient, serverSlug: string) {
   const serverResult = await client.query<{ id: string }>(
@@ -157,6 +183,61 @@ async function ensurePlayerAccount(client: PoolClient, playerId: string) {
   );
 }
 
+async function loadPlayerPresence(client: PoolClient, playerId: string) {
+  const presenceResult = await client.query<PresenceRow>(
+    `
+      select
+        psp.current_server_id as "currentServerId",
+        current_server.slug as "currentServerSlug",
+        psp.last_server_id as "lastServerId",
+        last_server.slug as "lastServerSlug",
+        last_server.name as "lastServerName",
+        psp.pending_transfer_server_id as "pendingTransferServerId",
+        pending_server.slug as "pendingTransferServerSlug",
+        pending_server.name as "pendingTransferServerName"
+      from player_server_presence psp
+      left join game_servers current_server
+        on current_server.id = psp.current_server_id
+       and current_server.is_active = true
+      left join game_servers last_server
+        on last_server.id = psp.last_server_id
+       and last_server.is_active = true
+      left join game_servers pending_server
+        on pending_server.id = psp.pending_transfer_server_id
+       and pending_server.is_active = true
+      where psp.player_id = $1
+      limit 1
+    `,
+    [playerId]
+  );
+
+  return presenceResult.rows[0] ?? null;
+}
+
+function resolveJoinRedirect(presence: PresenceRow | null, serverId: string) {
+  if (
+    presence?.pendingTransferServerId &&
+    presence.pendingTransferServerId !== serverId &&
+    presence.pendingTransferServerSlug
+  ) {
+    return {
+      serverSlug: presence.pendingTransferServerSlug,
+      serverName: presence.pendingTransferServerName || presence.pendingTransferServerSlug,
+      reason: "pending_transfer" as const
+    };
+  }
+
+  if (presence?.lastServerId && presence.lastServerId !== serverId && presence.lastServerSlug) {
+    return {
+      serverSlug: presence.lastServerSlug,
+      serverName: presence.lastServerName || presence.lastServerSlug,
+      reason: "last_server_resume" as const
+    };
+  }
+
+  return null;
+}
+
 export async function loadPlayerState(client: PoolClient, playerId: string) {
   const startTime = Date.now();
 
@@ -222,7 +303,9 @@ export async function loadPlayerState(client: PoolClient, playerId: string) {
   }
 
   const profile = profileResult.rows[0] ?? null;
-  if (!profile) return null;
+  if (!profile) {
+    return null;
+  }
 
   const inventory = inventoryResult.rows[0] ?? {
     inventory: [],
@@ -238,12 +321,13 @@ export async function loadPlayerState(client: PoolClient, playerId: string) {
     inventoryVersion: 0
   };
 
-  const row = { ...profile, ...inventory };
-
-  return row;
+  return {
+    ...profile,
+    ...inventory
+  };
 }
 
-export async function handleJoin(payload: JoinPayload) {
+export async function handleJoin(payload: JoinPayload): Promise<JoinResult> {
   const client = await pool.connect();
 
   try {
@@ -251,24 +335,35 @@ export async function handleJoin(payload: JoinPayload) {
 
     const serverId = await findServerId(client, payload.serverSlug);
     const playerId = await ensurePlayer(client, payload);
-    
-    // [DIAGNÓSTICO CRÍTICO]
-    console.warn(`[DEBUG_JOIN] USER_CONNECTED: GT=${payload.gamertag}, XUID=${payload.xuid}, PID=${playerId}`);
+    const presence = await loadPlayerPresence(client, playerId);
+    const redirect = resolveJoinRedirect(presence, serverId);
 
     await ensurePlayerAccount(client, playerId);
+
+    if (redirect) {
+      await client.query("commit");
+      return {
+        state: null,
+        redirect
+      };
+    }
 
     await client.query(
       `
         insert into player_server_presence (
           player_id,
           current_server_id,
+          last_server_id,
+          pending_transfer_server_id,
           online,
           last_joined_at,
           updated_at
         )
-        values ($1, $2, true, now(), now())
+        values ($1, $2, $2, null, true, now(), now())
         on conflict (player_id) do update
           set current_server_id = excluded.current_server_id,
+              last_server_id = excluded.last_server_id,
+              pending_transfer_server_id = null,
               online = true,
               last_joined_at = now(),
               updated_at = now()
@@ -287,7 +382,10 @@ export async function handleJoin(payload: JoinPayload) {
     const state = await loadPlayerState(client, playerId);
 
     await client.query("commit");
-    return state;
+    return {
+      state,
+      redirect: null
+    };
   } catch (error) {
     await client.query("rollback");
     throw error;
@@ -318,6 +416,11 @@ export async function saveInventory(payload: InventoryPayload) {
     await client.query("begin");
 
     const serverId = await findServerId(client, payload.serverSlug);
+    const transferDestinationSlug =
+      typeof payload.transferDestinationSlug === "string" ? payload.transferDestinationSlug.trim() : "";
+    const transferDestinationServerId = transferDestinationSlug
+      ? await findServerId(client, transferDestinationSlug)
+      : null;
     const playerId = await ensurePlayer(client, payload);
     await ensurePlayerAccount(client, playerId);
 
@@ -385,18 +488,22 @@ export async function saveInventory(payload: InventoryPayload) {
         insert into player_server_presence (
           player_id,
           current_server_id,
+          last_server_id,
+          pending_transfer_server_id,
           online,
           last_inventory_version,
           updated_at
         )
-        values ($1, $2, true, $3, now())
+        values ($1, $2, $2, $4, true, $3, now())
         on conflict (player_id) do update
           set current_server_id = excluded.current_server_id,
+              last_server_id = excluded.last_server_id,
+              pending_transfer_server_id = excluded.pending_transfer_server_id,
               online = true,
               last_inventory_version = excluded.last_inventory_version,
               updated_at = now()
       `,
-      [playerId, serverId, inventoryVersion]
+      [playerId, serverId, inventoryVersion, transferDestinationServerId]
     );
 
     await client.query(
@@ -421,6 +528,30 @@ export async function saveInventory(payload: InventoryPayload) {
         })
       ]
     );
+
+    if (transferDestinationServerId && transferDestinationSlug) {
+      await client.query(
+        `
+          insert into inventory_sync_events (
+            player_id,
+            server_id,
+            event_type,
+            snapshot_version,
+            payload
+          )
+          values ($1, $2, 'transfer', $3, $4::jsonb)
+        `,
+        [
+          playerId,
+          serverId,
+          inventoryVersion,
+          JSON.stringify({
+            fromServerSlug: payload.serverSlug,
+            destinationServerSlug: transferDestinationSlug
+          })
+        ]
+      );
+    }
 
     await client.query("commit");
     return {
@@ -451,13 +582,19 @@ export async function handleLeave(payload: LeavePayload) {
     await client.query(
       `
         update player_server_presence
-        set current_server_id = null,
-            online = false,
+        set current_server_id = case
+              when current_server_id = $2 then null
+              else current_server_id
+            end,
+            online = case
+              when current_server_id = $2 then false
+              else online
+            end,
             last_left_at = now(),
             updated_at = now()
         where player_id = $1
       `,
-      [playerId]
+      [playerId, serverId]
     );
 
     await client.query(

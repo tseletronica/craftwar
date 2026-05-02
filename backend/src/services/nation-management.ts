@@ -75,41 +75,41 @@ const NATION_CLASS_CATALOG: Record<
   fire: [
     {
       canonicalName: "Lâmina de Labareda",
-      aliases: ["guerreiro", "lamina", "lamina de labareda", "espada", "warrior"]
+      aliases: ["guerreiro", "guereiro", "gyerreiro", "lamina", "lamina de labareda", "espada", "warrior"]
     },
     {
       canonicalName: "Mestre da Fornalha",
-      aliases: ["construtor", "builder", "fornalha", "mestre da fornalha"]
+      aliases: ["construtor", "contrutor", "builder", "fornalha", "mestre da fornalha"]
     }
   ],
   water: [
     {
       canonicalName: "Tritão de Combate",
-      aliases: ["guerreiro", "tridente", "tritao", "tritao de combate", "warrior"]
+      aliases: ["guerreiro", "guereiro", "gyerreiro", "tridente", "tritao", "tritao de combate", "warrior"]
     },
     {
       canonicalName: "Mestre das Marés",
-      aliases: ["construtor", "builder", "mares", "mare", "mestre das mares", "mestre das mares"]
+      aliases: ["construtor", "contrutor", "builder", "mares", "mare", "mestre das mares", "mestre das mares"]
     }
   ],
   earth: [
     {
       canonicalName: "Guardião da Floresta",
-      aliases: ["guerreiro", "guardiao", "guardiao da floresta", "martelo", "warrior"]
+      aliases: ["guerreiro", "guereiro", "gyerreiro", "guardiao", "guardiao da floresta", "martelo", "warrior"]
     },
     {
       canonicalName: "Geólogo da Terra",
-      aliases: ["construtor", "builder", "geologo", "geologo da terra", "picareta"]
+      aliases: ["construtor", "contrutor", "builder", "geologo", "geologo da terra", "picareta"]
     }
   ],
   air: [
     {
       canonicalName: "Caçador do Céu",
-      aliases: ["cacador", "cacador do ceu", "guerreiro", "lanca", "warrior"]
+      aliases: ["cacador", "cacador do ceu", "guerreiro", "guereiro", "gyerreiro", "lanca", "warrior"]
     },
     {
       canonicalName: "Engenheiro de Nuvens",
-      aliases: ["construtor", "builder", "engenheiro", "engenheiro de nuvens", "picareta"]
+      aliases: ["construtor", "contrutor", "builder", "engenheiro", "engenheiro de nuvens", "picareta"]
     }
   ]
 };
