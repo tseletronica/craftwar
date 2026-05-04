@@ -3,36 +3,33 @@ import { z } from "zod";
 
 import { pool } from "../lib/db.js";
 import { rejectGamertagFallbackXuid } from "../lib/player-identity.js";
+import { isAdmin } from "./admin.js";
 
-export const joinPayloadSchema = z
-  .object({
-    xuid: z.string().min(1),
-    gamertag: z.string().min(1),
-    serverSlug: z.string().min(1),
-    legacyXuids: z.array(z.string().min(1)).default([])
-  })
-  .superRefine(rejectGamertagFallbackXuid);
+export const joinPayloadSchema = z.object({
+  xuid: z.string().min(1),
+  gamertag: z.string().min(1),
+  serverSlug: z.string().min(1),
+  legacyXuids: z.array(z.string().min(1)).default([])
+}).superRefine(rejectGamertagFallbackXuid);
 
-export const inventoryPayloadSchema = z
-  .object({
-    xuid: z.string().min(1),
-    gamertag: z.string().min(1),
-    serverSlug: z.string().min(1),
-    legacyXuids: z.array(z.string().min(1)).default([]),
-    transferDestinationSlug: z.string().min(1).optional().nullable(),
-    inventory: z.array(z.unknown()).default([]),
-    armor: z.array(z.unknown()).default([]),
-    enderChest: z.array(z.unknown()).default([]),
-    offhand: z.unknown().default({}),
-    hotbarSlot: z.number().int().min(0).max(8).default(0),
-    experienceLevel: z.number().int().min(0).default(0),
-    totalExperience: z.number().int().min(0).default(0),
-    health: z.number().min(0).default(20),
-    hunger: z.number().int().min(0).max(20).default(20),
-    saturation: z.number().min(0).default(5),
-    metadata: z.record(z.unknown()).default({})
-  })
-  .superRefine(rejectGamertagFallbackXuid);
+export const inventoryPayloadSchema = z.object({
+  xuid: z.string().min(1),
+  gamertag: z.string().min(1),
+  serverSlug: z.string().min(1),
+  legacyXuids: z.array(z.string().min(1)).default([]),
+  transferDestinationSlug: z.string().min(1).optional().nullable(),
+  inventory: z.array(z.unknown()).default([]),
+  armor: z.array(z.unknown()).default([]),
+  enderChest: z.array(z.unknown()).default([]),
+  offhand: z.unknown().default({}),
+  hotbarSlot: z.number().int().min(0).max(8).default(0),
+  experienceLevel: z.number().int().min(0).default(0),
+  totalExperience: z.number().int().min(0).default(0),
+  health: z.number().min(0).default(20),
+  hunger: z.number().int().min(0).max(20).default(20),
+  saturation: z.number().min(0).default(5),
+  metadata: z.record(z.unknown()).default({})
+}).superRefine(rejectGamertagFallbackXuid);
 
 export const leavePayloadSchema = z.object({
   xuid: z.string().min(1),
@@ -44,27 +41,58 @@ export const statePayloadSchema = z.object({
   xuid: z.string().min(1)
 });
 
-export const identityLookupPayloadSchema = z.object({
-  gamertag: z.string().min(1)
-});
-
-export const racePowerPayloadSchema = z
-  .object({
-    xuid: z.string().min(1),
-    gamertag: z.string().min(1),
-    serverSlug: z.string().min(1),
-    legacyXuids: z.array(z.string().min(1)).default([]),
-    raceKey: z.string().min(1),
-    cooldownMs: z.number().int().min(1).max(3600000)
-  })
-  .superRefine(rejectGamertagFallbackXuid);
+export const racePowerPayloadSchema = z.object({
+  xuid: z.string().min(1),
+  gamertag: z.string().min(1),
+  serverSlug: z.string().min(1),
+  legacyXuids: z.array(z.string().min(1)).default([]),
+  raceKey: z.string().min(1),
+  cooldownMs: z.number().int().min(1).max(3600000)
+}).superRefine(rejectGamertagFallbackXuid);
 
 type JoinPayload = z.infer<typeof joinPayloadSchema>;
 type InventoryPayload = z.infer<typeof inventoryPayloadSchema>;
 type LeavePayload = z.infer<typeof leavePayloadSchema>;
 type StatePayload = z.infer<typeof statePayloadSchema>;
-type IdentityLookupPayload = z.infer<typeof identityLookupPayloadSchema>;
 type RacePowerPayload = z.infer<typeof racePowerPayloadSchema>;
+
+const LOGIN_REWARD_TIMEZONE = "America/Sao_Paulo";
+const DAILY_LOGIN_REWARD_SCHEDULE = [10, 20, 30, 40, 50, 60, 100] as const;
+
+type PlayerAccountRow = {
+  id: string;
+  balance: string;
+};
+
+type DailyLoginRewardRow = {
+  streakDays: number;
+  lastClaimDate: string | null;
+  lastRewardAmount: number;
+  totalClaims: number;
+};
+
+type DailyLoginWindowRow = {
+  today: string;
+  yesterday: string;
+  sevenDayWindowStart: string;
+};
+
+type DailyLoginActivityRow = {
+  activePlayersToday: number;
+  activePlayers7d: number;
+};
+
+type DailyLoginRewardStatus = {
+  rewardGranted: boolean;
+  rewardAmount: number;
+  claimedToday: boolean;
+  streakDays: number;
+  rewardCycleDay: number;
+  nextRewardAmount: number;
+  activePlayersToday: number;
+  activePlayers7d: number;
+  weeklyCycleLength: number;
+};
 
 type PresenceRow = {
   currentServerId: string | null;
@@ -119,23 +147,6 @@ async function findPlayerIdByXuid(client: PoolClient, xuid: string) {
   );
 
   return playerResult.rows[0]?.id ?? null;
-}
-
-async function findPlayerIdentityByGamertag(client: PoolClient, gamertag: string) {
-  const playerResult = await client.query<{ xuid: string; gamertag: string }>(
-    `
-      select xuid, gamertag
-      from players
-      where lower(gamertag) = lower($1)
-        and xuid is not null
-        and btrim(xuid) <> ''
-      order by last_seen_at desc nulls last, created_at asc
-      limit 1
-    `,
-    [gamertag]
-  );
-
-  return playerResult.rows[0] ?? null;
 }
 
 async function ensurePlayer(client: PoolClient, payload: JoinPayload | InventoryPayload | RacePowerPayload) {
@@ -249,10 +260,6 @@ async function loadPlayerPresence(client: PoolClient, playerId: string) {
 }
 
 function resolveJoinRedirect(presence: PresenceRow | null, serverId: string) {
-  if (presence?.pendingTransferServerId === serverId) {
-    return null;
-  }
-
   if (
     presence?.pendingTransferServerId &&
     presence.pendingTransferServerId !== serverId &&
@@ -265,7 +272,205 @@ function resolveJoinRedirect(presence: PresenceRow | null, serverId: string) {
     };
   }
 
+  if (presence?.lastServerId && presence.lastServerId !== serverId && presence.lastServerSlug) {
+    return {
+      serverSlug: presence.lastServerSlug,
+      serverName: presence.lastServerName || presence.lastServerSlug,
+      reason: "last_server_resume" as const
+    };
+  }
+
   return null;
+}
+
+function getDailyRewardCycleDay(streakDays: number) {
+  if (streakDays <= 0) {
+    return 0;
+  }
+
+  return ((streakDays - 1) % DAILY_LOGIN_REWARD_SCHEDULE.length) + 1;
+}
+
+function getDailyRewardAmount(streakDays: number) {
+  const cycleDay = getDailyRewardCycleDay(streakDays);
+  if (cycleDay <= 0) {
+    return 0;
+  }
+
+  return DAILY_LOGIN_REWARD_SCHEDULE[cycleDay - 1] ?? 0;
+}
+
+async function lockPlayerDracoAccount(client: PoolClient, playerId: string) {
+  const accountResult = await client.query<PlayerAccountRow>(
+    `
+      select id, balance
+      from accounts
+      where currency_code = 'DRACO'
+        and player_id = $1
+      limit 1
+      for update
+    `,
+    [playerId]
+  );
+
+  return accountResult.rows[0] ?? null;
+}
+
+async function getDailyLoginWindow(client: PoolClient) {
+  const windowResult = await client.query<DailyLoginWindowRow>(
+    `
+      select
+        timezone($1, now())::date::text as today,
+        (timezone($1, now())::date - 1)::text as yesterday,
+        (timezone($1, now())::date - 6)::text as "sevenDayWindowStart"
+    `,
+    [LOGIN_REWARD_TIMEZONE]
+  );
+
+  return windowResult.rows[0];
+}
+
+async function getDailyLoginActivity(client: PoolClient, today: string, sevenDayWindowStart: string) {
+  const activityResult = await client.query<DailyLoginActivityRow>(
+    `
+      select
+        count(*) filter (where last_claim_date = $1)::int as "activePlayersToday",
+        count(*) filter (where last_claim_date >= $2)::int as "activePlayers7d"
+      from player_daily_login_rewards
+    `,
+    [today, sevenDayWindowStart]
+  );
+
+  return activityResult.rows[0] ?? {
+    activePlayersToday: 0,
+    activePlayers7d: 0
+  };
+}
+
+async function applyDailyLoginReward(client: PoolClient, playerId: string, serverId: string) {
+  const { today, yesterday, sevenDayWindowStart } = await getDailyLoginWindow(client);
+
+  const rewardStateResult = await client.query<DailyLoginRewardRow>(
+    `
+      select
+        streak_days as "streakDays",
+        last_claim_date::text as "lastClaimDate",
+        last_reward_amount as "lastRewardAmount",
+        total_claims as "totalClaims"
+      from player_daily_login_rewards
+      where player_id = $1
+      limit 1
+      for update
+    `,
+    [playerId]
+  );
+
+  const currentRewardState = rewardStateResult.rows[0] ?? {
+    streakDays: 0,
+    lastClaimDate: null,
+    lastRewardAmount: 0,
+    totalClaims: 0
+  };
+
+  const alreadyClaimedToday = currentRewardState.lastClaimDate === today;
+  let nextStreakDays = currentRewardState.streakDays;
+  let rewardAmount = 0;
+  let rewardGranted = false;
+
+  if (!alreadyClaimedToday) {
+    const continuesStreak = currentRewardState.lastClaimDate === yesterday;
+    nextStreakDays = continuesStreak ? currentRewardState.streakDays + 1 : 1;
+    rewardAmount = getDailyRewardAmount(nextStreakDays);
+    rewardGranted = rewardAmount > 0;
+
+    await client.query(
+      `
+        insert into player_daily_login_rewards (
+          player_id,
+          streak_days,
+          last_claim_date,
+          last_reward_amount,
+          total_claims
+        )
+        values ($1, $2, $3, $4, 1)
+        on conflict (player_id) do update
+          set streak_days = excluded.streak_days,
+              last_claim_date = excluded.last_claim_date,
+              last_reward_amount = excluded.last_reward_amount,
+              total_claims = player_daily_login_rewards.total_claims + 1,
+              updated_at = now()
+      `,
+      [playerId, nextStreakDays, today, rewardAmount]
+    );
+
+    if (rewardGranted) {
+      const playerAccount = await lockPlayerDracoAccount(client, playerId);
+      if (!playerAccount) {
+        throw new Error(`Unable to lock DRACO account for player ${playerId}`);
+      }
+
+      const currentBalance = BigInt(playerAccount.balance);
+      const nextBalance = currentBalance + BigInt(rewardAmount);
+
+      await client.query(
+        `
+          update accounts
+          set balance = $2,
+              updated_at = now()
+          where id = $1
+        `,
+        [playerAccount.id, nextBalance.toString()]
+      );
+
+      await client.query(
+        `
+          insert into draco_transactions (
+            to_account_id,
+            amount,
+            transaction_type,
+            status,
+            reason,
+            metadata,
+            created_by_player_id,
+            server_id
+          )
+          values (
+            $1, $2, 'reward', 'confirmed', 'daily_login', $3::jsonb, $4, $5
+          )
+        `,
+        [
+          playerAccount.id,
+          rewardAmount.toString(),
+          JSON.stringify({
+            source: "daily_login",
+            timezone: LOGIN_REWARD_TIMEZONE,
+            claimedOn: today,
+            streakDays: nextStreakDays,
+            rewardCycleDay: getDailyRewardCycleDay(nextStreakDays)
+          }),
+          playerId,
+          serverId
+        ]
+      );
+    }
+  }
+
+  const activity = await getDailyLoginActivity(client, today, sevenDayWindowStart);
+  const streakDays = alreadyClaimedToday ? currentRewardState.streakDays : nextStreakDays;
+  const rewardCycleDay = getDailyRewardCycleDay(streakDays);
+  const nextRewardAmount = getDailyRewardAmount(streakDays + 1);
+
+  return {
+    rewardGranted,
+    rewardAmount,
+    claimedToday: alreadyClaimedToday || rewardGranted,
+    streakDays,
+    rewardCycleDay,
+    nextRewardAmount,
+    activePlayersToday: Number(activity.activePlayersToday ?? 0),
+    activePlayers7d: Number(activity.activePlayers7d ?? 0),
+    weeklyCycleLength: DAILY_LOGIN_REWARD_SCHEDULE.length
+  } satisfies DailyLoginRewardStatus;
 }
 
 export async function loadPlayerState(client: PoolClient, playerId: string) {
@@ -279,7 +484,7 @@ export async function loadPlayerState(client: PoolClient, playerId: string) {
           p.xuid,
           p.gamertag,
           p.race,
-          p.class_name as "className",
+          coalesce(p.class_name, 'Cidadao') as "className",
           p.title,
           n.slug as "nationSlug",
           n.name as "nationName",
@@ -333,9 +538,7 @@ export async function loadPlayerState(client: PoolClient, playerId: string) {
   }
 
   const profile = profileResult.rows[0] ?? null;
-  if (!profile) {
-    return null;
-  }
+  if (!profile) return null;
 
   const inventory = inventoryResult.rows[0] ?? {
     inventory: [],
@@ -351,10 +554,9 @@ export async function loadPlayerState(client: PoolClient, playerId: string) {
     inventoryVersion: 0
   };
 
-  return {
-    ...profile,
-    ...inventory
-  };
+  const row = { ...profile, ...inventory };
+
+  return row;
 }
 
 export async function handleJoin(payload: JoinPayload): Promise<JoinResult> {
@@ -377,6 +579,8 @@ export async function handleJoin(payload: JoinPayload): Promise<JoinResult> {
         redirect
       };
     }
+
+    const dailyLoginReward = await applyDailyLoginReward(client, playerId, serverId);
 
     await client.query(
       `
@@ -413,7 +617,12 @@ export async function handleJoin(payload: JoinPayload): Promise<JoinResult> {
 
     await client.query("commit");
     return {
-      state,
+      state: state
+        ? {
+            ...state,
+            dailyLoginReward
+          }
+        : null,
       redirect: null
     };
   } catch (error) {
@@ -439,24 +648,6 @@ export async function getPlayerState(payload: StatePayload) {
   }
 }
 
-export async function resolvePlayerIdentity(payload: IdentityLookupPayload) {
-  const client = await pool.connect();
-
-  try {
-    const identity = await findPlayerIdentityByGamertag(client, payload.gamertag);
-    if (!identity) {
-      return null;
-    }
-
-    return {
-      xuid: identity.xuid,
-      gamertag: identity.gamertag
-    };
-  } finally {
-    client.release();
-  }
-}
-
 export async function saveInventory(payload: InventoryPayload) {
   const client = await pool.connect();
 
@@ -471,6 +662,68 @@ export async function saveInventory(payload: InventoryPayload) {
       : null;
     const playerId = await ensurePlayer(client, payload);
     await ensurePlayerAccount(client, playerId);
+    const presenceResult = await client.query<{
+      currentServerId: string | null;
+      online: boolean;
+      lastInventoryVersion: string;
+    }>(
+      `
+        select
+          current_server_id as "currentServerId",
+          online,
+          last_inventory_version as "lastInventoryVersion"
+        from player_server_presence
+        where player_id = $1
+        for update
+      `,
+      [playerId]
+    );
+    const currentPresence = presenceResult.rows[0] ?? null;
+
+    const metadataResult = await client.query<{ metadata: Record<string, unknown> | null }>(
+      `
+        select metadata
+        from player_inventories
+        where player_id = $1
+        limit 1
+        for update
+      `,
+      [playerId]
+    );
+    const storedMetadata =
+      metadataResult.rows[0]?.metadata && typeof metadataResult.rows[0].metadata === "object"
+        ? metadataResult.rows[0].metadata
+        : {};
+    const payloadMetadata = payload.metadata && typeof payload.metadata === "object" ? payload.metadata : {};
+    const mergedMetadata = {
+      ...storedMetadata,
+      ...payloadMetadata,
+      racePowerCooldowns: {
+        ...(storedMetadata.racePowerCooldowns && typeof storedMetadata.racePowerCooldowns === "object"
+          ? (storedMetadata.racePowerCooldowns as Record<string, unknown>)
+          : {}),
+        ...(payloadMetadata.racePowerCooldowns && typeof payloadMetadata.racePowerCooldowns === "object"
+          ? (payloadMetadata.racePowerCooldowns as Record<string, unknown>)
+          : {})
+      }
+    };
+
+    if (
+      currentPresence?.online &&
+      currentPresence.currentServerId &&
+      currentPresence.currentServerId !== serverId
+    ) {
+      console.warn(
+        `[PLAYER_SYNC] Ignorando save atrasado de ${payload.gamertag} em ${payload.serverSlug}; sessao ativa em outro servidor.`
+      );
+      await client.query("commit");
+      return {
+        playerId,
+        inventoryVersion: Number(currentPresence.lastInventoryVersion ?? 0),
+        accepted: false,
+        reason: "stale_server_write"
+      };
+    }
 
     const inventoryResult = await client.query<{ inventoryVersion: string }>(
       `
@@ -524,7 +777,7 @@ export async function saveInventory(payload: InventoryPayload) {
         payload.health,
         payload.hunger,
         payload.saturation,
-        JSON.stringify(payload.metadata),
+        JSON.stringify(mergedMetadata),
         serverId
       ]
     );
@@ -572,7 +825,7 @@ export async function saveInventory(payload: InventoryPayload) {
         JSON.stringify({
           inventorySize: payload.inventory.length,
           armorSize: payload.armor.length,
-          metadata: payload.metadata
+          metadata: mergedMetadata
         })
       ]
     );
@@ -638,7 +891,10 @@ export async function handleLeave(payload: LeavePayload) {
               when current_server_id = $2 then false
               else online
             end,
-            last_left_at = now(),
+            last_left_at = case
+              when current_server_id = $2 then now()
+              else last_left_at
+            end,
             updated_at = now()
         where player_id = $1
       `,

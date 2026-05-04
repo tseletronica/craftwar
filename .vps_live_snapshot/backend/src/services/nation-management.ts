@@ -77,8 +77,8 @@ const RACE_CATALOG: Array<{
   aliases: string[];
 }> = [
   {
-    canonicalName: "Anao",
-    aliases: ["anao", "anao", "dwarf"]
+    canonicalName: "Anão",
+    aliases: ["anao", "anão", "dwarf"]
   },
   {
     canonicalName: "Elfo",
@@ -102,100 +102,21 @@ const RACE_CATALOG: Array<{
   }
 ];
 
-const NATION_CLASS_CATALOG: Record<
-  string,
-  Array<{
-    canonicalName: string;
-    aliases: string[];
-  }>
-> = {
-  fire: [
-    {
-      canonicalName: "Lâmina de Labareda",
-      aliases: ["cavaleiro", "lamina", "lamina de labareda", "espada"]
-    },
-    {
-      canonicalName: "Mestre da Fornalha",
-      aliases: ["construtor", "contrutor", "builder", "fornalha", "mestre da fornalha"]
-    }
-  ],
-  water: [
-    {
-      canonicalName: "Tritão de Combate",
-      aliases: ["cavaleiro", "tridente", "tritao", "tritao de combate"]
-    },
-    {
-      canonicalName: "Mestre das Marés",
-      aliases: ["construtor", "contrutor", "builder", "mares", "mare", "mestre das mares", "mestre das mares"]
-    }
-  ],
-  earth: [
-    {
-      canonicalName: "Guardião da Floresta",
-      aliases: ["cavaleiro", "guardiao", "guardiao da floresta", "martelo"]
-    },
-    {
-      canonicalName: "Geólogo da Terra",
-      aliases: ["construtor", "contrutor", "builder", "geologo", "geologo da terra", "picareta"]
-    }
-  ],
-  air: [
-    {
-      canonicalName: "Caçador do Céu",
-      aliases: ["cacador", "cacador do ceu", "cavaleiro", "lanca"]
-    },
-    {
-      canonicalName: "Engenheiro de Nuvens",
-      aliases: ["construtor", "contrutor", "builder", "engenheiro", "engenheiro de nuvens", "picareta"]
-    }
-  ]
-};
-
 const GLOBAL_CARGO_CATALOG: Array<{
   canonicalName: string;
   aliases: string[];
 }> = [
   {
     canonicalName: "Cidadao",
-    aliases: ["cidadao", "cidadao", "citizen"]
+    aliases: ["cidadao", "cidadão", "citizen"]
   },
   {
     canonicalName: "Cavaleiro",
-    aliases: [
-      "cavaleiro",
-      "knight",
-      "cacador",
-      "cacador do ceu",
-      "combat",
-      "espada",
-      "guardiao",
-      "guardiao da floresta",
-      "lamina",
-      "lamina de labareda",
-      "lanca",
-      "martelo",
-      "tridente",
-      "tritao",
-      "tritao de combate"
-    ]
+    aliases: ["cavaleiro", "knight"]
   },
   {
     canonicalName: "Construtor",
-    aliases: [
-      "construtor",
-      "contrutor",
-      "builder",
-      "engenheiro",
-      "engenheiro de nuvens",
-      "fornalha",
-      "geologo",
-      "geologo da terra",
-      "mare",
-      "mares",
-      "mestre da fornalha",
-      "mestre das mares",
-      "picareta"
-    ]
+    aliases: ["construtor", "builder"]
   },
   {
     canonicalName: "Lord",
@@ -207,7 +128,10 @@ const GLOBAL_CARGO_CATALOG: Array<{
   }
 ];
 
-const LORD_ASSIGNABLE_CARGOS = new Set(["Cavaleiro", "Construtor"]);
+const LORD_ASSIGNABLE_CARGOS = new Set([
+  "Cavaleiro",
+  "Construtor"
+]);
 
 export class NationManagementError extends Error {
   statusCode: number;
@@ -250,6 +174,23 @@ function normalizeGamertag(value: string) {
   return value.trim().replace(/\s+/g, " ");
 }
 
+function logRaceSelection(payload: ChooseRacePayload, stage: string, extra: Record<string, unknown> = {}) {
+  try {
+    console.warn(
+      `[RACE_SELECT] ${JSON.stringify({
+        stage,
+        serverSlug: payload.serverSlug,
+        gamertag: payload.gamertag,
+        xuid: payload.xuid,
+        raceName: payload.raceName,
+        normalizedRaceName: normalizeText(payload.raceName),
+        ...extra
+      })}`
+    );
+  } catch (error) {
+  }
+}
+
 function isAdminIdentity(xuid: string, gamertag: string) {
   const normalizedGamertag = normalizeText(gamertag);
   const normalizedXuid = String(xuid || "").trim();
@@ -275,34 +216,15 @@ function resolveCanonicalRaceName(raceName: string) {
   return null;
 }
 
-function resolveCanonicalClassName(nationSlug: string, className: string) {
+function resolveCanonicalCargoName(className: string) {
   const normalizedClassName = normalizeText(className);
-  const globalEntries = GLOBAL_CARGO_CATALOG;
+  const entries = GLOBAL_CARGO_CATALOG;
 
-  for (const entry of globalEntries) {
+  for (const entry of entries) {
     if (
       normalizeText(entry.canonicalName) === normalizedClassName ||
       entry.aliases.some((alias) => normalizeText(alias) === normalizedClassName)
     ) {
-      return entry.canonicalName;
-    }
-  }
-
-  const nationEntries = NATION_CLASS_CATALOG[nationSlug] || [];
-
-  for (const entry of nationEntries) {
-    if (
-      normalizeText(entry.canonicalName) === normalizedClassName ||
-      entry.aliases.some((alias) => normalizeText(alias) === normalizedClassName)
-    ) {
-      if (entry.aliases.includes("cavaleiro")) {
-        return "Cavaleiro";
-      }
-
-      if (entry.aliases.includes("construtor")) {
-        return "Construtor";
-      }
-
       return entry.canonicalName;
     }
   }
@@ -310,8 +232,8 @@ function resolveCanonicalClassName(nationSlug: string, className: string) {
   return null;
 }
 
-function getMembershipRoleForCargo(className: string) {
-  return className === "Lord" || className === "Rei" ? "leader" : "citizen";
+function getMembershipRoleForCargo(cargoName: string) {
+  return cargoName === "Lord" ? "leader" : "citizen";
 }
 
 async function ensurePlayer(client: PoolClient, payload: ActorPayload) {
@@ -550,8 +472,8 @@ export async function chooseNation(payload: ChooseNationPayload) {
     await client.query(
       `
         update players
-        set primary_nation_id = $2,
-            class_name = 'Cidadao'
+        set primary_nation_id = $2
+            ,class_name = coalesce(class_name, 'Cidadao')
         where id = $1
       `,
       [playerId, nation.id]
@@ -579,12 +501,16 @@ export async function chooseRace(payload: ChooseRacePayload) {
 
   try {
     await client.query("begin");
+    logRaceSelection(payload, "attempt");
 
     const playerId = await ensurePlayer(client, payload);
     await ensurePlayerAccount(client, playerId);
     const canonicalRaceName = resolveCanonicalRaceName(payload.raceName);
 
     if (!canonicalRaceName) {
+      logRaceSelection(payload, "race_not_found", {
+        availableRaces: RACE_CATALOG.map((entry) => entry.canonicalName)
+      });
       throw createNationError(400, "race_not_found", `Unknown race: ${payload.raceName}`);
     }
 
@@ -601,10 +527,13 @@ export async function chooseRace(payload: ChooseRacePayload) {
 
     const currentRace = String(currentRaceResult.rows[0]?.race || "").trim();
     if (currentRace) {
+      logRaceSelection(payload, "race_already_selected", {
+        currentRace
+      });
       throw createNationError(
         409,
         "race_already_selected",
-        "Voce ja escolheu uma raca para este personagem."
+        "Você já escolheu uma raça para este personagem."
       );
     }
 
@@ -621,6 +550,9 @@ export async function chooseRace(payload: ChooseRacePayload) {
     const state = await loadPlayerState(client, playerId);
 
     await client.query("commit");
+    logRaceSelection(payload, "success", {
+      canonicalRaceName
+    });
 
     return {
       raceName: canonicalRaceName,
@@ -650,23 +582,20 @@ export async function promoteNationMember(payload: PromoteMemberPayload) {
     }
 
     const { actorIsAdmin, targetMembership } = await assertManagementPermission(client, payload, targetPlayer.id);
-    const canonicalClassName = resolveCanonicalClassName(targetMembership.nationSlug, payload.className);
+    const canonicalClassName = resolveCanonicalCargoName(payload.className);
 
     if (!canonicalClassName) {
       throw createNationError(
         400,
-        "invalid_class_for_nation",
-        "A classe informada não é válida para a nação atual do jogador.",
-        {
-          nationSlug: targetMembership.nationSlug
-        }
+        "invalid_cargo",
+        "O cargo informado não é válido."
       );
     }
 
     if (!actorIsAdmin && !LORD_ASSIGNABLE_CARGOS.has(canonicalClassName)) {
       throw createNationError(
         403,
-        "admin_only_cargo",
+        "insufficient_permissions",
         "Somente admins podem promover para Lord ou Rei."
       );
     }
@@ -805,7 +734,7 @@ export async function expelNationMember(payload: ExpelMemberPayload) {
     await client.query(
       `
         update players
-        set class_name = null,
+        set class_name = 'Cidadao',
             primary_nation_id = null
         where id = $1
       `,

@@ -7,7 +7,15 @@ const SURVIVAL_MODE = GameMode.Survival ?? GameMode.survival ?? 'survival';
 const ADVENTURE_MODE = GameMode.Adventure ?? GameMode.adventure ?? 'adventure';
 const ADMIN_COMMAND_LEVEL =
   CommandPermissionLevel.Admin ?? CommandPermissionLevel.GameDirectors ?? 2;
+const CAPITAL_SERVER_SLUG = 'capital';
+const EXPLORATION_SERVER_SLUG = 'exploration';
 const NATION_SERVER_SLUGS = new Set(['fire', 'water', 'earth', 'air']);
+const CAPITAL_ALLOWED_ENTITY_INTERACTION_IDS = new Set([
+  'minecraft:npc',
+  'minecraft:villager',
+  'minecraft:villager_v2',
+  'minecraft:wandering_trader'
+]);
 const GAMERULE_REAPPLY_INTERVAL_TICKS = 600;
 const MODE_ENFORCEMENT_INTERVAL_TICKS = 40;
 const ACTION_NOTICE_COOLDOWN_MS = 4000;
@@ -44,6 +52,10 @@ function normalizeDimensionId(value) {
   return 'overworld';
 }
 
+function getCurrentServerSlug() {
+  return normalizeName(NETWORK_CONFIG.serverSlug);
+}
+
 function isCreativeGamertag(player) {
   return adminGamertags.has(normalizeName(player?.name));
 }
@@ -58,6 +70,14 @@ function isSurvivalGameMode(value) {
 
 function isAdventureGameMode(value) {
   return String(value ?? '').trim().toLowerCase() === String(ADVENTURE_MODE).trim().toLowerCase();
+}
+
+function hasManualCreativeOverride(player) {
+  if (!isValidPlayer(player) || isCreativeGamertag(player)) {
+    return false;
+  }
+
+  return isCreativeGameMode(player.getGameMode?.());
 }
 
 function isValidPlayer(player) {
@@ -100,8 +120,16 @@ function sendThrottled(player, key, message, cooldownMs = ACTION_NOTICE_COOLDOWN
 }
 
 function getProtectedNationServerSlug() {
-  const serverSlug = normalizeName(NETWORK_CONFIG.serverSlug);
+  const serverSlug = getCurrentServerSlug();
   return NATION_SERVER_SLUGS.has(serverSlug) ? serverSlug : null;
+}
+
+function isCapitalServer() {
+  return getCurrentServerSlug() === CAPITAL_SERVER_SLUG;
+}
+
+function isExplorationServer() {
+  return getCurrentServerSlug() === EXPLORATION_SERVER_SLUG;
 }
 
 function getPlayerNationSlug(player) {
@@ -118,27 +146,12 @@ function getPlayerRoleKey(player) {
     return 'leader';
   }
 
-  const warriorTokens = [
-    'cavaleiro',
-    'cacador do ceu',
-    'combat',
-    'guardiao da floresta',
-    'lamina de labareda',
-    'tritao'
-  ];
-  if (warriorTokens.some((token) => className.includes(token))) {
-    return 'warrior';
+  if (className.includes('construtor')) {
+    return 'builder';
   }
 
-  const builderTokens = [
-    'construtor',
-    'engenheiro de nuvens',
-    'geologo',
-    'mestre da fornalha',
-    'mestre das mares'
-  ];
-  if (builderTokens.some((token) => className.includes(token))) {
-    return 'builder';
+  if (className.includes('cavaleiro')) {
+    return 'warrior';
   }
 
   return null;
@@ -166,6 +179,10 @@ function isVisitorInProtectedNation(player) {
   return getProtectedNationAccessType(player) === 'visitor';
 }
 
+function isProtectedCapitalPlayer(player) {
+  return isCapitalServer() && isValidPlayer(player) && !isCreativeGamertag(player);
+}
+
 function trySetGameMode(player, targetMode) {
   try {
     player.setGameMode(targetMode);
@@ -176,7 +193,13 @@ function trySetGameMode(player, targetMode) {
 }
 
 function tryRunWorldCommand(command) {
-  const overworld = world.getDimension('overworld');
+  let overworld = null;
+
+  try {
+    overworld = world.getDimension('overworld');
+  } catch (error) {
+    return false;
+  }
 
   try {
     if (typeof overworld?.runCommandAsync === 'function') {
@@ -206,6 +229,27 @@ function enforceNationProtectionGamerules() {
   tryRunWorldCommand('gamerule mobgriefing false');
   tryRunWorldCommand('gamerule tntexplodes false');
   tryRunWorldCommand('gamerule dofiretick false');
+}
+
+function enforceCapitalProtectionGamerules() {
+  if (!isCapitalServer()) {
+    return;
+  }
+
+  tryRunWorldCommand('gamerule keepinventory true');
+  tryRunWorldCommand('gamerule domobspawning false');
+  tryRunWorldCommand('gamerule mobgriefing false');
+  tryRunWorldCommand('gamerule tntexplodes false');
+  tryRunWorldCommand('gamerule dofiretick false');
+}
+
+function enforceExplorationDisplayGamerules() {
+  if (!isExplorationServer()) {
+    return;
+  }
+
+  tryRunWorldCommand('gamerule showcoordinates true');
+  tryRunWorldCommand('gamerule locatorbar true');
 }
 
 function toCenteredLocation(location, fallbackY = 80) {
@@ -376,8 +420,26 @@ function enforceProtectedNationMode(player, notify = false) {
   }
 }
 
+function enforceCapitalMode(player, notify = false) {
+  if (!isProtectedCapitalPlayer(player)) {
+    return;
+  }
+
+  if (!isAdventureGameMode(player.getGameMode?.()) && trySetGameMode(player, ADVENTURE_MODE) && notify) {
+    sendThrottled(
+      player,
+      'capital_adventure',
+      '\u00a7e[CAPITAL] Jogadores ficam em modo aventura na Capital publica.'
+    );
+  }
+}
+
 function enforceSurvivalForNonAdmins(player, notify = false) {
   if (!isValidPlayer(player) || isCreativeGamertag(player)) {
+    return;
+  }
+
+  if (hasManualCreativeOverride(player)) {
     return;
   }
 
@@ -398,6 +460,11 @@ function enforcePlayerModeRules(player, notify = false) {
 
   if (getProtectedNationServerSlug()) {
     enforceProtectedNationMode(player, notify);
+    return;
+  }
+
+  if (isCapitalServer()) {
+    enforceCapitalMode(player, notify);
     return;
   }
 
@@ -469,6 +536,49 @@ function cancelProtectedNationAction(eventPlayer, actionType, visitorKey, visito
   return false;
 }
 
+function cancelCapitalAction(eventPlayer, messageKey, messageText) {
+  if (!isProtectedCapitalPlayer(eventPlayer)) {
+    return false;
+  }
+
+  sendThrottled(eventPlayer, messageKey, messageText);
+  return true;
+}
+
+function getAttackingPlayer(damageSource) {
+  const directAttacker = damageSource?.damagingEntity;
+  if (isValidPlayer(directAttacker)) {
+    return directAttacker;
+  }
+
+  try {
+    const projectileOwner = damageSource?.damagingProjectile?.owner;
+    if (isValidPlayer(projectileOwner)) {
+      return projectileOwner;
+    }
+  } catch (error) {
+  }
+
+  try {
+    const projectileComponent = directAttacker?.getComponent?.('minecraft:projectile');
+    const projectileOwner = projectileComponent?.owner;
+    if (isValidPlayer(projectileOwner)) {
+      return projectileOwner;
+    }
+  } catch (error) {
+  }
+
+  return null;
+}
+
+function getEntityTypeId(entity) {
+  try {
+    return normalizeName(entity?.typeId);
+  } catch (error) {
+    return '';
+  }
+}
+
 function registerProtectedNationHooks() {
   if (!getProtectedNationServerSlug()) {
     return;
@@ -476,7 +586,7 @@ function registerProtectedNationHooks() {
 
   if (world.beforeEvents.entityHurt) {
     world.beforeEvents.entityHurt.subscribe((event) => {
-      const attacker = event.damageSource?.damagingEntity;
+      const attacker = getAttackingPlayer(event.damageSource);
       if (!isValidPlayer(attacker)) {
         return;
       }
@@ -530,9 +640,72 @@ function registerProtectedNationHooks() {
   }
 }
 
+function registerCapitalHooks() {
+  if (!isCapitalServer()) {
+    return;
+  }
+
+  if (world.beforeEvents.entityHurt) {
+    world.beforeEvents.entityHurt.subscribe((event) => {
+      const attacker = getAttackingPlayer(event.damageSource);
+      if (!isValidPlayer(attacker)) {
+        return;
+      }
+
+      if (!cancelCapitalAction(attacker, 'capital_damage', '\u00a7c[CAPITAL] Jogadores nao podem causar dano na Capital.')) {
+        return;
+      }
+
+      event.cancel = true;
+    });
+  }
+
+  if (world.beforeEvents.playerBreakBlock) {
+    world.beforeEvents.playerBreakBlock.subscribe((event) => {
+      if (!cancelCapitalAction(event.player, 'capital_break', '\u00a7c[CAPITAL] Jogadores nao podem quebrar blocos na Capital.')) {
+        return;
+      }
+
+      event.cancel = true;
+    });
+  }
+
+  if (world.beforeEvents.playerPlaceBlock) {
+    world.beforeEvents.playerPlaceBlock.subscribe((event) => {
+      if (!cancelCapitalAction(event.player, 'capital_place', '\u00a7c[CAPITAL] Jogadores nao podem colocar blocos na Capital.')) {
+        return;
+      }
+
+      event.cancel = true;
+    });
+  }
+
+  if (world.beforeEvents.playerInteractWithEntity) {
+    world.beforeEvents.playerInteractWithEntity.subscribe((event) => {
+      if (!isProtectedCapitalPlayer(event.player)) {
+        return;
+      }
+
+      if (CAPITAL_ALLOWED_ENTITY_INTERACTION_IDS.has(getEntityTypeId(event.target))) {
+        return;
+      }
+
+      sendThrottled(
+        event.player,
+        'capital_interact_entity',
+        '\u00a7c[CAPITAL] Apenas NPCs de loja podem ser usados pelos visitantes da Capital.'
+      );
+      event.cancel = true;
+    });
+  }
+}
+
 export function initializeServerRules() {
   enforceNationProtectionGamerules();
+  enforceCapitalProtectionGamerules();
+  enforceExplorationDisplayGamerules();
   registerProtectedNationHooks();
+  registerCapitalHooks();
 
   world.afterEvents.playerSpawn.subscribe((event) => {
     system.run(() => {
@@ -579,5 +752,13 @@ export function initializeServerRules() {
 
   system.runInterval(() => {
     enforceNationProtectionGamerules();
+  }, GAMERULE_REAPPLY_INTERVAL_TICKS);
+
+  system.runInterval(() => {
+    enforceCapitalProtectionGamerules();
+  }, GAMERULE_REAPPLY_INTERVAL_TICKS);
+
+  system.runInterval(() => {
+    enforceExplorationDisplayGamerules();
   }, GAMERULE_REAPPLY_INTERVAL_TICKS);
 }

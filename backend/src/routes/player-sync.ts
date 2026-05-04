@@ -4,9 +4,11 @@ import {
   getPlayerState,
   handleJoin,
   handleLeave,
+  identityLookupPayloadSchema,
   inventoryPayloadSchema,
   joinPayloadSchema,
   leavePayloadSchema,
+  resolvePlayerIdentity,
   statePayloadSchema,
   saveInventory
 } from "../services/player-sync.js";
@@ -44,6 +46,26 @@ export async function registerPlayerSyncRoutes(app: FastifyInstance) {
     }
 
     return reply.status(200).send(state);
+  });
+
+  app.post("/internal/player-sync/resolve-identity", async (request, reply) => {
+    const parsed = identityLookupPayloadSchema.safeParse(request.body);
+
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: "invalid_payload",
+        details: parsed.error.flatten().fieldErrors
+      });
+    }
+
+    const identity = await resolvePlayerIdentity(parsed.data);
+    if (!identity) {
+      return reply.status(404).send({
+        error: "player_not_found"
+      });
+    }
+
+    return reply.status(200).send(identity);
   });
 
   app.post("/internal/player-sync/inventory", async (request, reply) => {

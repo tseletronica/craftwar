@@ -1,13 +1,18 @@
-import { EquipmentSlot, ItemStack, Potions, system } from '@minecraft/server';
+import { EnchantmentType, EquipmentSlot, ItemStack, Potions, system } from '@minecraft/server';
 import { NETWORK_CONFIG } from './config.js';
 import { requestJson } from './bridge_client.js';
 
 const bundleCache = new Map();
 const persistentIdentityCache = new Map();
+const scheduledSaveRuns = new Map();
+const transferLeaveMarkers = new Map();
 const pendingTransferByPlayerId = new Map();
 const redirectingPlayerById = new Map();
 const PERSISTENT_ID_RETRY_TICKS = 5;
 const PERSISTENT_ID_MAX_RETRIES = 8;
+const DEFAULT_SCHEDULED_SAVE_DELAY_TICKS = 20;
+const SAVE_RETRY_ATTEMPTS = 2;
+const SAVE_RETRY_DELAY_TICKS = 10;
 const TRANSITION_STATE_TTL_MS = 30000;
 
 const ARMOR_SLOT_MAP = {
@@ -16,6 +21,20 @@ const ARMOR_SLOT_MAP = {
   legs: EquipmentSlot.Legs,
   feet: EquipmentSlot.Feet
 };
+
+function createDefaultDailyLoginState() {
+  return {
+    rewardGranted: false,
+    rewardAmount: 0,
+    claimedToday: false,
+    streakDays: 0,
+    rewardCycleDay: 0,
+    nextRewardAmount: 0,
+    activePlayersToday: 0,
+    activePlayers7d: 0,
+    weeklyCycleLength: 7
+  };
+}
 
 function normalizeName(value) {
   return String(value || '').trim().toLowerCase();
@@ -155,36 +174,7 @@ async function resolvePlayerIdentity(player) {
     identity = getPlayerIdentity(player);
   }
 
-  if (!identity.xuid && identity.gamertag) {
-    const resolvedIdentity = await resolvePlayerIdentityFromBackend(identity.gamertag);
-    if (resolvedIdentity?.xuid) {
-      rememberPersistentIdentity(identity.gamertag, resolvedIdentity.xuid);
-      rememberPersistentIdentity(resolvedIdentity.gamertag, resolvedIdentity.xuid);
-      identity = getPlayerIdentity(player);
-    }
-  }
-
   return identity;
-}
-
-async function resolvePlayerIdentityFromBackend(gamertag) {
-  const normalizedGamertag = String(gamertag || '').trim();
-  if (!normalizedGamertag) {
-    return null;
-  }
-
-  const response = await requestJson('POST', '/internal/player-sync/resolve-identity', {
-    gamertag: normalizedGamertag
-  });
-
-  if (!response.ok || !response.data?.xuid) {
-    return null;
-  }
-
-  return {
-    xuid: String(response.data.xuid || '').trim(),
-    gamertag: String(response.data.gamertag || normalizedGamertag).trim()
-  };
 }
 
 function readErrorCode(response) {
@@ -196,12 +186,132 @@ function readErrorCode(response) {
   );
 }
 
+function isFiniteNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function normalizeStringArray(values) {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+
+  return values
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+}
+
+function safeRead(fn, fallback = undefined) {
+  try {
+    const value = fn();
+    return value === undefined ? fallback : value;
+  } catch (error) {
+    return fallback;
+  }
+}
+
+function readItemLore(item) {
+  return normalizeStringArray(safeRead(() => item.getLore(), []));
+}
+
+function readItemEnchantments(item) {
+  const enchantable = safeRead(() => item.getComponent('minecraft:enchantable'));
+  const enchantments = safeRead(() => enchantable?.getEnchantments(), []);
+  if (!Array.isArray(enchantments)) {
+    return [];
+  }
+
+  return enchantments
+    .map((entry) => ({
+      typeId: String(entry?.type?.id || '').trim(),
+      level: Math.max(1, Math.trunc(Number(entry?.level ?? 0)))
+    }))
+    .filter((entry) => entry.typeId && Number.isFinite(entry.level));
+}
+
+function readItemDurability(item) {
+  const durability = safeRead(() => item.getComponent('minecraft:durability'));
+  if (!durability) {
+    return null;
+  }
+
+  const damage = Number(durability.damage);
+  const unbreakable = Boolean(durability.unbreakable);
+  if (!Number.isFinite(damage) && !unbreakable) {
+    return null;
+  }
+
+  return {
+    damage: Number.isFinite(damage) ? Math.max(0, Math.trunc(damage)) : 0,
+    unbreakable
+  };
+}
+
+function readItemDyeColor(item) {
+  const dyeable = safeRead(() => item.getComponent('minecraft:dyeable'));
+  const color = dyeable?.color;
+  if (!color || !isFiniteNumber(color.red) || !isFiniteNumber(color.green) || !isFiniteNumber(color.blue)) {
+    return null;
+  }
+
+  return {
+    red: Math.max(0, Math.trunc(color.red)),
+    green: Math.max(0, Math.trunc(color.green)),
+    blue: Math.max(0, Math.trunc(color.blue))
+  };
+}
+
+function readItemDynamicProperties(item) {
+  const propertyIds = normalizeStringArray(safeRead(() => item.getDynamicPropertyIds(), []));
+  if (!propertyIds.length) {
+    return null;
+  }
+
+  const values = {};
+  for (const propertyId of propertyIds) {
+    const value = safeRead(() => item.getDynamicProperty(propertyId));
+    if (value === undefined) {
+      continue;
+    }
+
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      values[propertyId] = value;
+      continue;
+    }
+
+    if (
+      value &&
+      typeof value === 'object' &&
+      isFiniteNumber(value.x) &&
+      isFiniteNumber(value.y) &&
+      isFiniteNumber(value.z)
+    ) {
+      values[propertyId] = {
+        x: Number(value.x),
+        y: Number(value.y),
+        z: Number(value.z)
+      };
+    }
+  }
+
+  return Object.keys(values).length ? values : null;
+}
+
 function serializeItem(item, extra = {}) {
   if (!item) {
     return null;
   }
 
+  const lore = readItemLore(item);
+  const enchantments = readItemEnchantments(item);
+  const durability = readItemDurability(item);
+  const canDestroy = normalizeStringArray(safeRead(() => item.getCanDestroy(), []));
+  const canPlaceOn = normalizeStringArray(safeRead(() => item.getCanPlaceOn(), []));
+  const dynamicProperties = readItemDynamicProperties(item);
+  const dyeColor = readItemDyeColor(item);
+  const lockMode = safeRead(() => item.lockMode, null);
+  const keepOnDeath = Boolean(safeRead(() => item.keepOnDeath, false));
   let potion = null;
+
   try {
     const potionComponent = item.getComponent?.('minecraft:potion');
     const effectTypeId = String(potionComponent?.potionEffectType?.id || '').trim();
@@ -220,9 +330,132 @@ function serializeItem(item, extra = {}) {
     typeId: item.typeId,
     amount: item.amount,
     nameTag: item.nameTag || null,
+    keepOnDeath,
+    lockMode: lockMode ?? null,
+    lore,
+    enchantments,
+    durability,
+    canDestroy,
+    canPlaceOn,
+    dynamicProperties,
+    dyeColor,
     potion,
     ...extra
   };
+}
+
+function applyItemLore(item, lore) {
+  if (!Array.isArray(lore) || typeof item.setLore !== 'function') {
+    return;
+  }
+
+  const normalizedLore = normalizeStringArray(lore);
+  safeRead(() => item.setLore(normalizedLore.length ? normalizedLore : undefined));
+}
+
+function applyItemPlacementRules(item, itemData) {
+  if (typeof item.setCanDestroy === 'function') {
+    const canDestroy = normalizeStringArray(itemData?.canDestroy);
+    safeRead(() => item.setCanDestroy(canDestroy.length ? canDestroy : undefined));
+  }
+
+  if (typeof item.setCanPlaceOn === 'function') {
+    const canPlaceOn = normalizeStringArray(itemData?.canPlaceOn);
+    safeRead(() => item.setCanPlaceOn(canPlaceOn.length ? canPlaceOn : undefined));
+  }
+}
+
+function applyItemDynamicProperties(item, itemData) {
+  if (!itemData?.dynamicProperties || typeof item.setDynamicProperties !== 'function') {
+    return;
+  }
+
+  safeRead(() => item.setDynamicProperties(itemData.dynamicProperties));
+}
+
+function applyItemDurability(item, itemData) {
+  const durability = safeRead(() => item.getComponent('minecraft:durability'));
+  if (!durability || !itemData?.durability) {
+    return;
+  }
+
+  if (typeof itemData.durability.unbreakable === 'boolean') {
+    durability.unbreakable = itemData.durability.unbreakable;
+  }
+
+  const damage = Number(itemData.durability.damage);
+  if (Number.isFinite(damage)) {
+    durability.damage = Math.max(0, Math.trunc(damage));
+  }
+}
+
+function applyItemDyeColor(item, itemData) {
+  const dyeable = safeRead(() => item.getComponent('minecraft:dyeable'));
+  const color = itemData?.dyeColor;
+  if (
+    !dyeable ||
+    !color ||
+    !isFiniteNumber(color.red) ||
+    !isFiniteNumber(color.green) ||
+    !isFiniteNumber(color.blue)
+  ) {
+    return;
+  }
+
+  dyeable.color = {
+    red: Math.max(0, Math.trunc(color.red)),
+    green: Math.max(0, Math.trunc(color.green)),
+    blue: Math.max(0, Math.trunc(color.blue))
+  };
+}
+
+function applyItemEnchantments(item, itemData) {
+  const enchantable = safeRead(() => item.getComponent('minecraft:enchantable'));
+  if (!enchantable || !Array.isArray(itemData?.enchantments)) {
+    return;
+  }
+
+  const enchantments = itemData.enchantments
+    .map((entry) => {
+      const typeId = String(entry?.typeId || '').trim();
+      const level = Math.max(1, Math.trunc(Number(entry?.level ?? 0)));
+      if (!typeId || !Number.isFinite(level)) {
+        return null;
+      }
+
+      try {
+        return {
+          type: new EnchantmentType(typeId),
+          level
+        };
+      } catch (error) {
+        return null;
+      }
+    })
+    .filter(Boolean);
+
+  if (!enchantments.length) {
+    return;
+  }
+
+  safeRead(() => enchantable.removeAllEnchantments());
+
+  if (typeof enchantable.addEnchantments === 'function') {
+    const applied = safeRead(() => {
+      enchantable.addEnchantments(enchantments);
+      return true;
+    }, false);
+
+    if (applied) {
+      return;
+    }
+  }
+
+  if (typeof enchantable.addEnchantment === 'function') {
+    for (const enchantment of enchantments) {
+      safeRead(() => enchantable.addEnchantment(enchantment));
+    }
+  }
 }
 
 function deserializeItem(itemData) {
@@ -264,6 +497,20 @@ function deserializeItem(itemData) {
       item.nameTag = itemData.nameTag;
     }
 
+    if (typeof itemData.keepOnDeath === 'boolean') {
+      item.keepOnDeath = itemData.keepOnDeath;
+    }
+
+    if (itemData.lockMode !== null && itemData.lockMode !== undefined) {
+      item.lockMode = itemData.lockMode;
+    }
+
+    applyItemLore(item, itemData.lore);
+    applyItemPlacementRules(item, itemData);
+    applyItemDynamicProperties(item, itemData);
+    applyItemDurability(item, itemData);
+    applyItemDyeColor(item, itemData);
+    applyItemEnchantments(item, itemData);
     return item;
   } catch (error) {
     return undefined;
@@ -293,7 +540,7 @@ function readLocationState(player) {
   };
 }
 
-function serializeInventory(player, identitySource, options = {}) {
+function serializeInventory(player, identitySource, metadata = {}, options = {}) {
   const inventoryComponent = player.getComponent('minecraft:inventory');
   const container = inventoryComponent?.container;
   const equippable = player.getComponent('minecraft:equippable');
@@ -341,10 +588,128 @@ function serializeInventory(player, identitySource, options = {}) {
       savedAt: new Date().toISOString(),
       sourceServer: NETWORK_CONFIG.serverSlug,
       identitySource,
+      itemFormatVersion: 2,
       lastKnownLocation: readLocationState(player),
-      transferDestinationSlug
+      transferDestinationSlug,
+      ...metadata
     }
   };
+}
+
+function buildPlayerInventorySnapshot(player, options = {}) {
+  const identity = options.identity || getPlayerIdentity(player);
+  if (!identity?.xuid) {
+    return null;
+  }
+
+  return {
+    player,
+    identity,
+    previousBundle: getCachedBundle(player),
+    inventoryState: serializeInventory(player, identity.identitySource, {
+      saveReason: String(options.reason || 'manual')
+    }, {
+      transferDestinationSlug: options.transferDestinationSlug
+    })
+  };
+}
+
+function consumeTransferLeaveMarker(player) {
+  const playerId = String(player?.id || '').trim();
+  if (!playerId) {
+    return null;
+  }
+
+  const marker = transferLeaveMarkers.get(playerId) || null;
+  transferLeaveMarkers.delete(playerId);
+  return marker;
+}
+
+export function markTransferLeave(player, destinationSlug = '') {
+  const playerId = String(player?.id || '').trim();
+  if (!playerId) {
+    return false;
+  }
+
+  transferLeaveMarkers.set(playerId, {
+    destinationSlug: String(destinationSlug || '').trim(),
+    markedAt: Date.now()
+  });
+  return true;
+}
+
+export function clearTransferLeave(player) {
+  const playerId = String(player?.id || '').trim();
+  if (!playerId) {
+    return false;
+  }
+
+  return transferLeaveMarkers.delete(playerId);
+}
+
+async function persistInventorySnapshot(snapshot) {
+  const transferDestinationSlug =
+    normalizeServerSlug(snapshot?.inventoryState?.metadata?.transferDestinationSlug) || null;
+  const response = await requestJson('POST', '/internal/player-sync/inventory', {
+    xuid: snapshot.identity.xuid,
+    gamertag: snapshot.identity.gamertag,
+    serverSlug: NETWORK_CONFIG.serverSlug,
+    legacyXuids: snapshot.identity.legacyXuids,
+    transferDestinationSlug,
+    inventory: snapshot.inventoryState.inventory,
+    armor: snapshot.inventoryState.armor,
+    enderChest: snapshot.inventoryState.enderChest,
+    offhand: snapshot.inventoryState.offhand,
+    hotbarSlot: snapshot.inventoryState.hotbarSlot,
+    experienceLevel: snapshot.inventoryState.experienceLevel,
+    totalExperience: snapshot.inventoryState.totalExperience,
+    health: snapshot.inventoryState.health,
+    hunger: snapshot.inventoryState.hunger,
+    saturation: snapshot.inventoryState.saturation,
+    metadata: snapshot.inventoryState.metadata
+  });
+
+  if (!response.ok || !response.data) {
+    return { ok: false, error: readErrorCode(response) };
+  }
+
+  let nextBundle = null;
+  if (snapshot.previousBundle) {
+    nextBundle = {
+      ...snapshot.previousBundle,
+      inventory: {
+        revision: Number(response.data.inventoryVersion ?? snapshot.previousBundle?.inventory?.revision ?? 0),
+        data: snapshot.inventoryState
+      }
+    };
+  }
+
+  if (snapshot.player?.id && nextBundle) {
+    cacheBundle(snapshot.player, nextBundle);
+  }
+
+  return { ok: true, bundle: nextBundle };
+}
+
+async function persistInventorySnapshotWithRetry(snapshot, attempts = SAVE_RETRY_ATTEMPTS) {
+  let lastResult = null;
+
+  for (let attempt = 0; attempt <= attempts; attempt += 1) {
+    lastResult = await persistInventorySnapshot(snapshot).catch((error) => ({
+      ok: false,
+      error: error?.message || 'save_failed'
+    }));
+
+    if (lastResult?.ok) {
+      return lastResult;
+    }
+
+    if (attempt < attempts) {
+      await waitTicks(SAVE_RETRY_DELAY_TICKS);
+    }
+  }
+
+  return lastResult || { ok: false, error: 'save_failed' };
 }
 
 function clearInventory(player) {
@@ -413,6 +778,13 @@ function applyInventory(player, inventoryState) {
 }
 
 function normalizeBundle(state) {
+  const dailyLoginSource =
+    state?.dailyLoginReward && typeof state.dailyLoginReward === 'object'
+      ? state.dailyLoginReward
+      : state?.dailyLogin && typeof state.dailyLogin === 'object'
+        ? state.dailyLogin
+        : null;
+
   return {
     profile: {
       displayName: state?.gamertag ?? null,
@@ -446,6 +818,17 @@ function normalizeBundle(state) {
       balance: Number(state?.dracoBalance ?? 0),
       nationBalance: Number(state?.nationDracoBalance ?? 0),
       kingdomBalance: Number(state?.kingdomDracoBalance ?? 0)
+    },
+    dailyLogin: {
+      rewardGranted: Boolean(dailyLoginSource?.rewardGranted),
+      rewardAmount: Number(dailyLoginSource?.rewardAmount ?? 0),
+      claimedToday: Boolean(dailyLoginSource?.claimedToday),
+      streakDays: Number(dailyLoginSource?.streakDays ?? 0),
+      rewardCycleDay: Number(dailyLoginSource?.rewardCycleDay ?? 0),
+      nextRewardAmount: Number(dailyLoginSource?.nextRewardAmount ?? 0),
+      activePlayersToday: Number(dailyLoginSource?.activePlayersToday ?? 0),
+      activePlayers7d: Number(dailyLoginSource?.activePlayers7d ?? 0),
+      weeklyCycleLength: Number(dailyLoginSource?.weeklyCycleLength ?? 7)
     }
   };
 }
@@ -455,9 +838,11 @@ function cacheBundle(player, bundle) {
   return bundle;
 }
 
-function applyBundleToPlayer(player, state) {
+function applyBundleToPlayer(player, state, options = {}) {
   const bundle = cacheBundle(player, normalizeBundle(state));
-  applyInventory(player, bundle.inventory.data);
+  if (options.applyInventory !== false) {
+    applyInventory(player, bundle.inventory.data);
+  }
   return bundle;
 }
 
@@ -531,7 +916,7 @@ export async function connectPlayer(player) {
   return { ok: true, redirected: false, redirect: null, bundle };
 }
 
-export async function reloadPlayerBundle(player) {
+export async function reloadPlayerBundle(player, options = {}) {
   const identity = await resolvePlayerIdentity(player);
   if (!identity.xuid) {
     return { ok: false, error: 'missing_persistent_id' };
@@ -545,7 +930,7 @@ export async function reloadPlayerBundle(player) {
     return { ok: false, error: readErrorCode(response) };
   }
 
-  const bundle = applyBundleToPlayer(player, response.data);
+  const bundle = applyBundleToPlayer(player, response.data, options);
 
   return { ok: true, bundle };
 }
@@ -559,70 +944,68 @@ export async function heartbeatPlayer(player) {
 }
 
 export async function savePlayerState(player, options = {}) {
+  const immediateSnapshot = buildPlayerInventorySnapshot(player, {
+    reason: options.reason,
+    transferDestinationSlug: options.transferDestinationSlug
+  });
+  if (immediateSnapshot) {
+    return persistInventorySnapshotWithRetry(immediateSnapshot);
+  }
+
   const identity = await resolvePlayerIdentity(player);
   if (!identity.xuid) {
     return { ok: false, error: 'missing_persistent_id' };
   }
 
-  const transferDestinationSlug = normalizeServerSlug(options?.transferDestinationSlug) || null;
-  const inventoryState = serializeInventory(player, identity.identitySource, {
-    transferDestinationSlug
+  const fallbackSnapshot = buildPlayerInventorySnapshot(player, {
+    identity,
+    reason: options.reason,
+    transferDestinationSlug: options.transferDestinationSlug
   });
-  const response = await requestJson('POST', '/internal/player-sync/inventory', {
-    xuid: identity.xuid,
-    gamertag: identity.gamertag,
-    serverSlug: NETWORK_CONFIG.serverSlug,
-    legacyXuids: identity.legacyXuids,
-    transferDestinationSlug,
-    inventory: inventoryState.inventory,
-    armor: inventoryState.armor,
-    enderChest: inventoryState.enderChest,
-    offhand: inventoryState.offhand,
-    hotbarSlot: inventoryState.hotbarSlot,
-    experienceLevel: inventoryState.experienceLevel,
-    totalExperience: inventoryState.totalExperience,
-    health: inventoryState.health,
-    hunger: inventoryState.hunger,
-    saturation: inventoryState.saturation,
-    metadata: inventoryState.metadata
-  });
-
-  if (!response.ok || !response.data) {
-    return { ok: false, error: readErrorCode(response) };
+  if (!fallbackSnapshot) {
+    return { ok: false, error: 'missing_persistent_id' };
   }
 
-  const previousBundle = getCachedBundle(player);
-  const nextBundle = {
-    profile: previousBundle?.profile || {
-      displayName: identity.gamertag,
-      race: null,
-      className: null,
-      title: null,
-      kingdomSlug: null,
-      kingdomName: null,
-      nationSlug: null,
-      nationName: null,
-      clanId: null,
-      clanName: null,
-      clanTag: null
-    },
-    inventory: {
-      revision: Number(response.data.inventoryVersion ?? previousBundle?.inventory?.revision ?? 0),
-      data: inventoryState
-    },
-    economy: previousBundle?.economy || {
-      balance: 0,
-      nationBalance: 0,
-      kingdomBalance: 0
+  return persistInventorySnapshotWithRetry(fallbackSnapshot);
+}
+
+export function schedulePlayerStateSave(player, options = {}) {
+  const playerId = String(player?.id || '').trim();
+  if (!playerId) {
+    return false;
+  }
+
+  const delayTicks = Math.max(1, Math.trunc(Number(options.delayTicks ?? DEFAULT_SCHEDULED_SAVE_DELAY_TICKS)));
+  const runId = (scheduledSaveRuns.get(playerId)?.runId ?? 0) + 1;
+  const reason = String(options.reason || 'inventory_change');
+
+  scheduledSaveRuns.set(playerId, { runId, reason });
+  system.runTimeout(async () => {
+    const scheduled = scheduledSaveRuns.get(playerId);
+    if (!scheduled || scheduled.runId !== runId) {
+      return;
     }
-  };
 
-  cacheBundle(player, nextBundle);
+    scheduledSaveRuns.delete(playerId);
+    const result = await savePlayerState(player, { reason }).catch((error) => ({
+      ok: false,
+      error: error?.message || 'save_failed'
+    }));
 
-  return { ok: true, bundle: nextBundle };
+    if (!result?.ok) {
+      console.warn(`[PLAYER_SYNC] Falha ao salvar estado agendado de ${playerId}: ${result?.error || 'save_failed'}`);
+    }
+  }, delayTicks);
+
+  return true;
 }
 
 export async function disconnectPlayer(player) {
+  const playerId = String(player?.id || '').trim();
+  if (playerId) {
+    scheduledSaveRuns.delete(playerId);
+  }
+
   const redirectDestinationSlug = getPlayerAwaitingRedirect(player);
   if (redirectDestinationSlug) {
     bundleCache.delete(player.id);
@@ -634,16 +1017,32 @@ export async function disconnectPlayer(player) {
     };
   }
 
-  const identity = await resolvePlayerIdentity(player);
+  const transferLeave = consumeTransferLeaveMarker(player);
+  const transferDestinationSlug = getPlayerTransferIntent(player) || String(transferLeave?.destinationSlug || '').trim() || null;
+
+  const snapshot = buildPlayerInventorySnapshot(player, { reason: 'leave' });
+  const identity = snapshot?.identity || (await resolvePlayerIdentity(player));
   if (!identity.xuid) {
     clearPlayerTransferIntent(player);
     return { ok: true };
   }
 
-  const transferDestinationSlug = getPlayerTransferIntent(player);
-
   if (!transferDestinationSlug) {
-    await savePlayerState(player).catch(() => null);
+    if (snapshot) {
+      const saveResult = await persistInventorySnapshotWithRetry(snapshot);
+      if (!saveResult.ok) {
+        console.warn(`[PLAYER_SYNC] Falha ao salvar antes do leave de ${identity.gamertag}: ${saveResult.error}`);
+      }
+    } else {
+      const saveResult = await savePlayerState(player, { reason: 'leave' }).catch((error) => ({
+        ok: false,
+        error: error?.message || 'save_failed'
+      }));
+
+      if (!saveResult.ok) {
+        console.warn(`[PLAYER_SYNC] Falha ao salvar estado no leave de ${identity.gamertag}: ${saveResult.error}`);
+      }
+    }
   }
 
   const response = await requestJson('POST', '/internal/player-sync/leave', {
@@ -751,6 +1150,46 @@ export async function mintBalance(player, targetGamertag, amount) {
   };
 }
 
+export async function purchaseBalance(player, amount, options = {}) {
+  const identity = await resolvePlayerIdentity(player);
+  if (!identity.xuid) {
+    return { ok: false, error: 'missing_persistent_id' };
+  }
+
+  const normalizedAmount = Number(amount);
+  if (!Number.isSafeInteger(normalizedAmount) || normalizedAmount <= 0) {
+    return { ok: false, error: 'invalid_amount' };
+  }
+
+  const response = await requestJson('POST', '/internal/economy/purchase', {
+    xuid: identity.xuid,
+    gamertag: identity.gamertag,
+    serverSlug: NETWORK_CONFIG.serverSlug,
+    legacyXuids: identity.legacyXuids,
+    amount: normalizedAmount,
+    reason: String(options.reason || 'npc_shop'),
+    shopId: String(options.shopId || ''),
+    itemId: String(options.itemId || '')
+  });
+
+  if (!response.ok || !response.data) {
+    return {
+      ok: false,
+      error: readErrorCode(response),
+      details: response.data?.details || null
+    };
+  }
+
+  setCachedBalance(player, response.data.balance);
+
+  return {
+    ok: true,
+    amount: Number(response.data.amount ?? normalizedAmount),
+    balance: Number(response.data.balance ?? 0),
+    transactionId: String(response.data.transactionId || '')
+  };
+}
+
 export async function getTopRicos() {
   const response = await requestJson('GET', '/internal/economy/top');
 
@@ -799,6 +1238,68 @@ export async function chooseNation(player, nationSlug) {
     nationSlug: String(response.data.nationSlug || nationSlug),
     nationName: String(response.data.nationName || ''),
     bundle
+  };
+}
+
+export async function chooseRace(player, raceName) {
+  const identity = await resolvePlayerIdentity(player);
+  if (!identity.xuid) {
+    return { ok: false, error: 'missing_persistent_id' };
+  }
+
+  const response = await requestJson('POST', '/internal/races/select', {
+    xuid: identity.xuid,
+    gamertag: identity.gamertag,
+    serverSlug: NETWORK_CONFIG.serverSlug,
+    legacyXuids: identity.legacyXuids,
+    raceName
+  });
+
+  if (!response.ok || !response.data?.state) {
+    return {
+      ok: false,
+      error: readErrorCode(response),
+      details: response.data?.details || null
+    };
+  }
+
+  const bundle = applyBundleToPlayer(player, response.data.state);
+
+  return {
+    ok: true,
+    raceName: String(response.data.raceName || raceName),
+    bundle
+  };
+}
+
+export async function reserveRacePower(player, raceKey, cooldownMs) {
+  const identity = await resolvePlayerIdentity(player);
+  if (!identity.xuid) {
+    return { ok: false, error: 'missing_persistent_id' };
+  }
+
+  const response = await requestJson('POST', '/internal/player-sync/race-power', {
+    xuid: identity.xuid,
+    gamertag: identity.gamertag,
+    serverSlug: NETWORK_CONFIG.serverSlug,
+    legacyXuids: identity.legacyXuids,
+    raceKey,
+    cooldownMs
+  });
+
+  if (!response.ok || !response.data) {
+    return {
+      ok: false,
+      error: readErrorCode(response),
+      details: response.data?.details || null
+    };
+  }
+
+  return {
+    ok: Boolean(response.data.ok),
+    reason: String(response.data.reason || ''),
+    nextAvailableAt: Number(response.data.nextAvailableAt ?? 0),
+    remainingMs: Number(response.data.remainingMs ?? 0)
   };
 }
 

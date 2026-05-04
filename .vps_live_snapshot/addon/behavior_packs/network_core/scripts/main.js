@@ -5,6 +5,7 @@ import { NETWORK_CONFIG } from './config.js';
 import {
   clearPlayerAwaitingRedirect,
   chooseNation,
+  chooseRace,
   connectPlayer,
   demoteNationMember,
   disconnectPlayer,
@@ -18,10 +19,13 @@ import {
   reloadPlayerBundle,
   rememberPersistentIdentity,
   savePlayerState,
+  schedulePlayerStateSave,
   setCachedBalance,
   transferBalance
 } from './player_sync.js';
 import { initializeNationAbilities } from './nation_abilities.js';
+import { initializeRaceAbilities } from './race_abilities.js';
+import { initializeShopSystem, openMainShop } from './npc_shops.js';
 import { initializeServerRules } from './server_rules.js';
 import { maybeHandleTransferCommand, transferPlayerToSlug } from './server_transfer.js';
 
@@ -35,6 +39,14 @@ function send(player, message) {
 function debugNationSelection(message) {
   try {
     console.warn(`[NATION_UI] ${message}`);
+  } catch (error) {
+  }
+}
+
+function debugRaceSelection(message, extra = null) {
+  try {
+    const suffix = extra ? ` ${JSON.stringify(extra)}` : '';
+    console.warn(`[RACE_SELECT][${NETWORK_CONFIG.serverSlug}] ${message}${suffix}`);
   } catch (error) {
   }
 }
@@ -71,6 +83,11 @@ function formatDracoBalance(value) {
   }
 
   return `${Math.trunc(amount)} dracos`;
+}
+
+function formatDayCount(value) {
+  const amount = Math.max(0, Math.trunc(Number(value ?? 0)));
+  return `${amount} ${amount === 1 ? 'dia' : 'dias'}`;
 }
 
 function parsePayCommand(rawMessage) {
@@ -194,11 +211,21 @@ const NATION_SELECTION_OPTIONS = [
   }
 ];
 
-const nationSelectionCooldownUntil = new Map();
-const nationSelectionPending = new Set();
-const activeNationMenus = new Map();
+const RACE_COMMAND_OPTIONS = [
+  ['anao', 'Anão'],
+  ['elfo', 'Elfo'],
+  ['orc', 'Orc'],
+  ['celestial', 'Celestial'],
+  ['sombrio', 'Sombrio'],
+  ['feral', 'Feral']
+];
 
-const PROMOTION_CLASS_ALIASES = [
+const nationSelectionCooldownUntil = new Map();
+const activeNationMenus = new Map();
+const inventorySyncReadyPlayers = new Set();
+const profileRecoveryRuns = new Map();
+
+const PROMOTION_CARGO_ALIASES = [
   'cavaleiro',
   'construtor',
   'lord',
@@ -241,6 +268,15 @@ function parseNationChoiceCommand(rawMessage) {
   return resolveNationSlug(stripOuterQuotes(match[1]));
 }
 
+function parseRaceChoiceCommand(rawMessage) {
+  const match = String(rawMessage || '').trim().match(/^!raca\s+(.+)$/i);
+  if (!match) {
+    return null;
+  }
+
+  return stripOuterQuotes(match[1]);
+}
+
 function parseSingleTargetCommand(rawMessage, commandKeyword) {
   const match = String(rawMessage || '').trim().match(new RegExp(`^!${commandKeyword}\\s+(.+)$`, 'i'));
   if (!match) {
@@ -281,7 +317,7 @@ function parsePromoteCommand(rawMessage) {
     return null;
   }
 
-  for (const alias of PROMOTION_CLASS_ALIASES) {
+  for (const alias of PROMOTION_CARGO_ALIASES) {
     const aliasTokens = alias.split(' ');
     if (aliasTokens.length >= tokens.length) {
       continue;
@@ -311,6 +347,13 @@ function sendNationSelectionHint(player) {
   send(
     player,
     '\u00a7e[NACAO] Voce ainda nao escolheu uma nacao. Use \u00a7f!nacoes\u00a7e para abrir a selecao ou \u00a7f!nacao fogo|agua|terra|vento\u00a7e.'
+  );
+}
+
+function sendRaceSelectionHint(player) {
+  send(
+    player,
+    '\u00a7e[RACA] Escolha sua raca com \u00a7f!raca anao|elfo|orc|celestial|sombrio|feral\u00a7e.'
   );
 }
 
@@ -350,37 +393,11 @@ function applyPlayerNationNameTag(player, bundleOverride = null) {
   }
 }
 
-function queueNationSelection(player) {
-  if (!isPlayerValid(player)) {
-    return;
-  }
-
-  nationSelectionPending.add(player.id);
-  debugNationSelection(`queue:${player.name}`);
-
-  try {
-    player.addEffect('resistance', 999999, {
-      amplifier: 255,
-      showParticles: false
-    });
-  } catch (error) {
-  }
-
-  try {
-    player.addEffect('slowness', 40, {
-      amplifier: 2,
-      showParticles: false
-    });
-  } catch (error) {
-  }
-}
-
 function clearNationSelection(player) {
   if (!player?.id) {
     return;
   }
 
-  nationSelectionPending.delete(player.id);
   clearActiveNationMenu(player);
   debugNationSelection(`clear:${player.name}`);
 
@@ -474,7 +491,8 @@ async function finalizeNationSelection(player, selectedOption) {
   applyPlayerNationNameTag(player, result.bundle);
   send(player, `\u00a7a[NACAO] Voce agora pertence a \u00a7b${nationDisplayName}\u00a7a.`);
   send(player, `\u00a77Para viajar ao seu mapa, use \u00a7f${travelCommand}\u00a77.`);
-  send(player, '\u00a77Depois disso, um lord pode usar \u00a7f!promover Seu Nome Classe\u00a77 para definir sua classe.');
+  sendRaceSelectionHint(player);
+  send(player, '\u00a77Depois disso, um lord pode usar \u00a7f!promover Seu Nome Cargo\u00a77 para definir seu cargo.');
 }
 
 async function openNationSelectionForm(player, options = {}) {
@@ -535,7 +553,7 @@ async function openNationSelectionForm(player, options = {}) {
 
     if (selectionResult?.canceled) {
       debugNationSelection(`show:canceled:${player.name}:retry=${retryCount}`);
-      if (retryCount > 0 || nationSelectionPending.has(player.id)) {
+      if (retryCount > 0) {
         system.runTimeout(() => {
           void openNationSelectionForm(player, {
             force: true,
@@ -565,7 +583,7 @@ async function openNationSelectionForm(player, options = {}) {
   } catch (error) {
     clearActiveNationMenu(player);
     debugNationSelection(`show:catch:${player.name}:retry=${retryCount}`);
-    if (retryCount > 0 || nationSelectionPending.has(player.id)) {
+    if (retryCount > 0) {
       system.runTimeout(() => {
         void openNationSelectionForm(player, {
           force: true,
@@ -587,19 +605,173 @@ async function openNationSelectionForm(player, options = {}) {
 function sendLoginSummary(player, bundle) {
   const profile = bundle?.profile ?? {};
   const economy = bundle?.economy ?? {};
+  const dailyLogin = bundle?.dailyLogin ?? {};
   const kingdomName = readProfileValue(profile.kingdomName, 'Sem reino');
   const nationName = readProfileValue(profile.nationName, 'Sem nacao');
-  const className = readProfileValue(profile.className, 'Sem classe');
+  const raceName = readProfileValue(profile.race, 'Sem raca');
+  const className = readProfileValue(profile.className, 'Cidadao');
+  const streakDays = Math.max(0, Math.trunc(Number(dailyLogin.streakDays ?? 0)));
+  const rewardAmount = Math.max(0, Math.trunc(Number(dailyLogin.rewardAmount ?? 0)));
+  const rewardCycleDay = Math.max(0, Math.trunc(Number(dailyLogin.rewardCycleDay ?? 0)));
+  const nextRewardAmount = Math.max(0, Math.trunc(Number(dailyLogin.nextRewardAmount ?? 0)));
+  const weeklyCycleLength = Math.max(1, Math.trunc(Number(dailyLogin.weeklyCycleLength ?? 7)));
+  const activePlayersToday = Math.max(0, Math.trunc(Number(dailyLogin.activePlayersToday ?? 0)));
+  const activePlayers7d = Math.max(0, Math.trunc(Number(dailyLogin.activePlayers7d ?? 0)));
 
   send(player, `\u00a7a[NETWORK] Perfil carregado em \u00a7f${NETWORK_CONFIG.serverSlug}\u00a7a.`);
   send(player, `\u00a77Saldo: \u00a7e${formatDracoBalance(economy.balance ?? 0)} \u00a78| \u00a77Reino: \u00a76${kingdomName}`);
-  send(player, `\u00a77Nacao: \u00a7b${nationName} \u00a78| \u00a77Classe: \u00a76${className}`);
+  send(player, `\u00a77Nacao: \u00a7b${nationName} \u00a78| \u00a77Raca: \u00a7d${raceName}`);
+  send(player, `\u00a77Cargo: \u00a76${className}`);
+
+  if (dailyLogin.rewardGranted && rewardAmount > 0) {
+    send(
+      player,
+      `\u00a76[LOGIN] Bonus diario: \u00a7e+${formatDracoBalance(rewardAmount)} \u00a78| \u00a77Sequencia: \u00a7b${formatDayCount(streakDays)} \u00a78| \u00a77Dia \u00a7f${rewardCycleDay}/${weeklyCycleLength}`
+    );
+  } else if (dailyLogin.claimedToday && streakDays > 0) {
+    send(
+      player,
+      `\u00a7e[LOGIN] Bonus diario ja resgatado hoje. \u00a78| \u00a77Sequencia: \u00a7b${formatDayCount(streakDays)} \u00a78| \u00a77Proximo: \u00a7e${formatDracoBalance(nextRewardAmount)}`
+    );
+  }
+
+  if (activePlayersToday > 0 || activePlayers7d > 0) {
+    send(
+      player,
+      `\u00a77Ativos: \u00a7a${activePlayersToday} hoje \u00a78| \u00a7b${activePlayers7d} nos ultimos 7 dias`
+    );
+  }
 }
 
 function waitTicks(ticks) {
   return new Promise((resolve) => {
     system.runTimeout(resolve, Math.max(1, Number(ticks) || 1));
   });
+}
+
+async function connectPlayerWithRetry(player, options = {}) {
+  const attempts = Math.max(1, Math.trunc(Number(options.attempts ?? 6)));
+  const retryDelayTicks = Math.max(1, Math.trunc(Number(options.retryDelayTicks ?? 40)));
+  let lastError = 'profile_sync_failed';
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (!isPlayerValid(player)) {
+      return { ok: false, error: 'player_invalid' };
+    }
+
+    const result = await connectPlayer(player).catch((error) => ({
+      ok: false,
+      error: error?.message || 'profile_sync_failed'
+    }));
+
+    if (result?.ok) {
+      return result;
+    }
+
+    lastError = result?.error || lastError;
+    if (attempt < attempts - 1) {
+      await waitTicks(retryDelayTicks);
+    }
+  }
+
+  return {
+    ok: false,
+    error: lastError
+  };
+}
+
+function clearProfileRecovery(player) {
+  const playerId = String(player?.id || '').trim();
+  if (!playerId) {
+    return;
+  }
+
+  profileRecoveryRuns.delete(playerId);
+}
+
+function scheduleProfileRecovery(player, options = {}) {
+  const playerId = String(player?.id || '').trim();
+  if (!playerId) {
+    return false;
+  }
+
+  const attempts = Math.max(1, Math.trunc(Number(options.attempts ?? 6)));
+  const retryDelayTicks = Math.max(1, Math.trunc(Number(options.retryDelayTicks ?? 100)));
+  const runId = (profileRecoveryRuns.get(playerId)?.runId ?? 0) + 1;
+  profileRecoveryRuns.set(playerId, { runId });
+
+  system.runTimeout(async () => {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const scheduled = profileRecoveryRuns.get(playerId);
+      if (!scheduled || scheduled.runId !== runId || !isPlayerValid(player)) {
+        return;
+      }
+
+      if (getCachedBundle(player)) {
+        profileRecoveryRuns.delete(playerId);
+        return;
+      }
+
+      const result = await reloadPlayerBundle(player, {
+        applyInventory: false
+      }).catch((error) => ({
+        ok: false,
+        error: error?.message || 'profile_reload_failed'
+      }));
+
+      if (result?.ok) {
+        profileRecoveryRuns.delete(playerId);
+        applyPlayerNationNameTag(player, result.bundle);
+        send(player, '\u00a7a[NETWORK] Perfil compartilhado recuperado apos a viagem.');
+        return;
+      }
+
+      if (attempt < attempts - 1) {
+        await waitTicks(retryDelayTicks);
+      }
+    }
+
+    const scheduled = profileRecoveryRuns.get(playerId);
+    if (scheduled?.runId === runId) {
+      profileRecoveryRuns.delete(playerId);
+    }
+  }, retryDelayTicks);
+
+  return true;
+}
+
+function clearInventorySyncReady(player) {
+  const playerId = String(player?.id || '').trim();
+  if (!playerId) {
+    return;
+  }
+
+  inventorySyncReadyPlayers.delete(playerId);
+}
+
+function markInventorySyncReady(player, delayTicks = 60) {
+  const playerId = String(player?.id || '').trim();
+  if (!playerId) {
+    return;
+  }
+
+  inventorySyncReadyPlayers.delete(playerId);
+  system.runTimeout(() => {
+    if (!isPlayerValid(player)) {
+      return;
+    }
+
+    inventorySyncReadyPlayers.add(playerId);
+  }, Math.max(1, Math.trunc(Number(delayTicks) || 60)));
+}
+
+function isInventorySyncReady(player) {
+  const playerId = String(player?.id || '').trim();
+  if (!playerId) {
+    return false;
+  }
+
+  return inventorySyncReadyPlayers.has(playerId);
 }
 
 async function handleAsyncPlayerJoin(event) {
@@ -610,12 +782,22 @@ async function handleAsyncPlayerJoin(event) {
   rememberPersistentIdentity(event.name ?? event.playerName, event.persistentId);
 }
 
+function safelyInitialize(label, initializer) {
+  try {
+    initializer();
+  } catch (error) {
+    console.error(`[NETWORK_INIT] ${label}: ${error}`);
+  }
+}
+
 system.run(() => {
   adminBeforeEvents.asyncPlayerJoin.subscribe(handleAsyncPlayerJoin);
 });
 
-initializeServerRules();
-initializeNationAbilities();
+safelyInitialize('server_rules', initializeServerRules);
+safelyInitialize('nation_abilities', initializeNationAbilities);
+safelyInitialize('race_abilities', initializeRaceAbilities);
+safelyInitialize('shop_system', initializeShopSystem);
 
 world.afterEvents.playerSpawn.subscribe((event) => {
   if (!event.initialSpawn) {
@@ -623,27 +805,29 @@ world.afterEvents.playerSpawn.subscribe((event) => {
   }
 
   const player = event.player;
+  clearInventorySyncReady(player);
+  clearProfileRecovery(player);
   system.runTimeout(async () => {
     if (!isPlayerValid(player)) {
       return;
     }
 
     send(player, '\u00a7a[NETWORK] Sincronizando perfil compartilhado...');
-    let result = await connectPlayer(player);
-    for (let attempt = 0; attempt < 3 && !result.ok && result.error === 'missing_persistent_id'; attempt += 1) {
-      await waitTicks(40);
-      if (!isPlayerValid(player)) {
-        return;
-      }
-
-      result = await connectPlayer(player);
-    }
+    const result = await connectPlayerWithRetry(player, {
+      attempts: 6,
+      retryDelayTicks: 40
+    });
 
     if (!result.ok) {
       send(player, `\u00a7c[NETWORK] Falha ao carregar seu perfil compartilhado: ${result.error}`);
+      scheduleProfileRecovery(player, {
+        attempts: 6,
+        retryDelayTicks: 100
+      });
       return;
     }
 
+    clearProfileRecovery(player);
     if (result.redirected && result.redirect?.serverSlug) {
       markPlayerAwaitingRedirect(player, result.redirect.serverSlug);
       send(
@@ -660,6 +844,10 @@ world.afterEvents.playerSpawn.subscribe((event) => {
       if (!redirectResult.ok) {
         clearPlayerAwaitingRedirect(player);
         send(player, `\u00a7c[NETWORK] Nao foi possivel retomar sua sessao automaticamente: ${redirectResult.error}`);
+        scheduleProfileRecovery(player, {
+          attempts: 6,
+          retryDelayTicks: 100
+        });
       }
       return;
     }
@@ -667,27 +855,18 @@ world.afterEvents.playerSpawn.subscribe((event) => {
     const profile = result.bundle?.profile ?? {};
     applyPlayerNationNameTag(player, result.bundle);
     sendLoginSummary(player, result.bundle);
+    markInventorySyncReady(player, 60);
 
     if (!String(profile.nationSlug || '').trim()) {
-      queueNationSelection(player);
       debugNationSelection(`spawn:no-nation:${player.name}`);
-      send(player, '\u00a7e[NACAO] Voce ainda nao tem nacao. Abrindo a selecao...');
-      system.runTimeout(() => {
-        openNationSelectionForm(player, {
-          retryCount: 6,
-          retryDelayTicks: 30
-        });
-      }, 100);
+      send(player, '\u00a7e[NACAO] Voce ainda nao tem nacao. Use \u00a7f!nacoes\u00a7e ou \u00a7f!nacao fogo|agua|terra|vento\u00a7e quando quiser escolher.');
       return;
     }
 
     clearNationSelection(player);
 
-    if (!String(profile.className || '').trim()) {
-      send(
-        player,
-        '\u00a7e[NAÇÃO] Você ainda não tem classe. Um lord da sua nação pode usar \u00a7f!promover Seu Nome Classe\u00a7e, mesmo se você estiver offline.'
-      );
+    if (!String(profile.race || '').trim()) {
+      sendRaceSelectionHint(player);
     }
   }, 20);
 });
@@ -695,44 +874,33 @@ world.afterEvents.playerSpawn.subscribe((event) => {
 world.beforeEvents.playerLeave.subscribe((event) => {
   const player = event.player;
   clearNationSelection(player);
-  system.run(async () => {
-    await disconnectPlayer(player).catch(() => null);
+  clearInventorySyncReady(player);
+  clearProfileRecovery(player);
+  void disconnectPlayer(player).catch(() => null);
+});
+
+world.afterEvents.playerInventoryItemChange.subscribe((event) => {
+  if (!isPlayerValid(event.player) || !isInventorySyncReady(event.player) || isPlayerInTransientNetworkState(event.player)) {
+    return;
+  }
+
+  schedulePlayerStateSave(event.player, {
+    delayTicks: 20,
+    reason: 'inventory_change'
   });
 });
 
 system.runInterval(() => {
   for (const player of world.getAllPlayers()) {
-    if (isPlayerInTransientNetworkState(player)) {
+    if (!isInventorySyncReady(player) || isPlayerInTransientNetworkState(player)) {
       continue;
     }
 
     system.run(async () => {
-      await savePlayerState(player).catch(() => null);
+      await savePlayerState(player, { reason: 'autosave' }).catch(() => null);
     });
   }
 }, NETWORK_CONFIG.autosaveIntervalTicks);
-
-system.runInterval(() => {
-  for (const player of world.getAllPlayers()) {
-    if (!nationSelectionPending.has(player.id)) {
-      continue;
-    }
-
-    const cachedBundle = getCachedBundle(player);
-    const currentNationSlug = String(cachedBundle?.profile?.nationSlug || '').trim();
-    if (currentNationSlug) {
-      clearNationSelection(player);
-      continue;
-    }
-
-    queueNationSelection(player);
-    openNationSelectionForm(player, {
-      retryCount: 1,
-      retryDelayTicks: 20,
-      silentRetry: true
-    });
-  }
-}, 120);
 
 system.runInterval(() => {
   for (const player of world.getAllPlayers()) {
@@ -755,7 +923,6 @@ world.beforeEvents.chatSend.subscribe((event) => {
     event.cancel = true;
     system.runTimeout(() => {
       debugNationSelection(`command:nacoes:${player.name}`);
-      queueNationSelection(player);
       send(player, '\u00a77[NACAO] Abrindo selecao...');
       openNationSelectionForm(player, {
         force: true,
@@ -799,7 +966,77 @@ world.beforeEvents.chatSend.subscribe((event) => {
       applyPlayerNationNameTag(player, result.bundle);
       send(player, `\u00a7a[NAÇÃO] Você agora pertence a \u00a7b${nationDisplayName}\u00a7a.`);
       send(player, `\u00a77Para viajar ao seu mapa, use \u00a7f${travelCommand}\u00a77.`);
+      sendRaceSelectionHint(player);
     });
+    return;
+  }
+
+  if (normalizedMessage === '!raca') {
+    event.cancel = true;
+    sendRaceSelectionHint(player);
+    send(
+      player,
+      `\u00a77[RACA] Opcoes: ${RACE_COMMAND_OPTIONS.map((entry) => `\u00a7f${entry[0]}`).join('\u00a77, ')}`
+    );
+    return;
+  }
+
+  if (normalizedMessage.startsWith('!raca ')) {
+    event.cancel = true;
+    const raceName = parseRaceChoiceCommand(rawMessage);
+    debugRaceSelection('command_received', {
+      player: String(player?.name || ''),
+      rawMessage: String(rawMessage || ''),
+      parsedRaceName: String(raceName || '')
+    });
+
+    if (!raceName) {
+      debugRaceSelection('command_invalid', {
+        player: String(player?.name || ''),
+        rawMessage: String(rawMessage || '')
+      });
+      sendRaceSelectionHint(player);
+      return;
+    }
+
+    system.run(async () => {
+      const result = await chooseRace(player, raceName);
+
+      if (!result.ok) {
+        debugRaceSelection('command_failed', {
+          player: String(player?.name || ''),
+          requestedRace: String(raceName || ''),
+          error: String(result.error || ''),
+          details: result.details || null
+        });
+        switch (result.error) {
+          case 'race_already_selected':
+            send(player, '\u00a7c[RACA] Voce ja escolheu uma raca para este personagem.');
+            break;
+          case 'race_not_found':
+            send(player, '\u00a7c[RACA] A raca informada nao existe.');
+            break;
+          default:
+            send(player, `\u00a7c[RACA] Falha ao escolher raca: ${result.error}`);
+            break;
+        }
+        return;
+      }
+
+      debugRaceSelection('command_succeeded', {
+        player: String(player?.name || ''),
+        requestedRace: String(raceName || ''),
+        resolvedRace: String(result.raceName || '')
+      });
+      send(player, `\u00a7a[RACA] Sua raca agora e \u00a7d${result.raceName}\u00a7a.`);
+      send(player, '\u00a77Sua habilidade racial agora ativa automaticamente em combate.');
+    });
+    return;
+  }
+
+  if (normalizedMessage === '!poder') {
+    event.cancel = true;
+    send(player, '\u00a7e[RACA] As habilidades raciais agora ativam automaticamente em combate.');
     return;
   }
 
@@ -809,10 +1046,7 @@ world.beforeEvents.chatSend.subscribe((event) => {
 
     if (!parsedCommand) {
       send(player, '\u00a7e[NACAO] Uso: !promover <jogador> <cargo>');
-      send(
-        player,
-        '\u00a77Classes aceitas: cavaleiro, construtor, ou o nome completo da classe da nação. Ex.: !promover Espoleta Azul cavaleiro'
-      );
+      send(player, '\u00a77Cargos aceitos: \u00a7fCavaleiro\u00a77, \u00a7fConstrutor\u00a77, \u00a7fLord\u00a77, \u00a7fRei');
       return;
     }
 
@@ -833,14 +1067,8 @@ world.beforeEvents.chatSend.subscribe((event) => {
           case 'cross_nation_management_denied':
             send(player, '\u00a7c[NAÇÃO] Você só pode promover membros da sua própria nação.');
             break;
-          case 'invalid_class_for_nation':
-            send(player, '\u00a7c[NAÇÃO] Essa classe não pertence à nação atual do jogador.');
-            break;
           case 'invalid_cargo':
-            send(player, '\u00a7c[NAÃ‡ÃƒO] Esse cargo nÃ£o Ã© vÃ¡lido.');
-            break;
-          case 'admin_only_cargo':
-            send(player, '\u00a7c[NAÃ‡ÃƒO] Somente admins da rede podem promover para Lord ou Rei.');
+            send(player, '\u00a7c[NACAO] Esse cargo nao existe.');
             break;
           case 'cannot_manage_self':
             send(player, '\u00a7c[NAÇÃO] Você não pode usar esse comando em si mesmo.');
@@ -857,14 +1085,14 @@ world.beforeEvents.chatSend.subscribe((event) => {
 
       send(
         player,
-        `\u00a7a[NAÇÃO] \u00a7f${result.targetGamertag}\u00a7a foi promovido para \u00a76${result.className}\u00a7a.`
+        `\u00a7a[NACAO] \u00a7f${result.targetGamertag}\u00a7a recebeu o cargo \u00a76${result.className}\u00a7a.`
       );
 
       const refreshedTarget = await refreshOnlinePlayerBundle(result.targetGamertag);
       if (refreshedTarget?.player && refreshedTarget.player.id !== player.id) {
         send(
           refreshedTarget.player,
-          `\u00a7a[NAÇÃO] Você foi promovido para \u00a76${result.className}\u00a7a em \u00a7b${result.nationName}\u00a7a.`
+          `\u00a7a[NACAO] Voce recebeu o cargo \u00a76${result.className}\u00a7a em \u00a7b${result.nationName}\u00a7a.`
         );
       }
     });
@@ -910,13 +1138,13 @@ world.beforeEvents.chatSend.subscribe((event) => {
         return;
       }
 
-      send(player, `\u00a7a[NAÇÃO] \u00a7f${result.targetGamertag}\u00a7a voltou para sem classe.`);
+      send(player, `\u00a7a[NACAO] \u00a7f${result.targetGamertag}\u00a7a voltou para \u00a76Cidadao\u00a7a.`);
 
       const refreshedTarget = await refreshOnlinePlayerBundle(result.targetGamertag);
       if (refreshedTarget?.player && refreshedTarget.player.id !== player.id) {
         send(
           refreshedTarget.player,
-          `\u00a7e[NAÇÃO] Sua classe foi removida em \u00a7b${result.nationName}\u00a7e.`
+          `\u00a7e[NACAO] Seu cargo voltou para \u00a76Cidadao\u00a7e em \u00a7b${result.nationName}\u00a7e.`
         );
       }
     });
@@ -1008,6 +1236,19 @@ world.beforeEvents.chatSend.subscribe((event) => {
         console.error(`RANKING_ERROR: ${err}`);
       }
     });
+    return;
+  }
+
+  if (normalizedMessage === '!loja' || normalizedMessage === '!shop') {
+    event.cancel = true;
+    send(player, '\u00a77[LOJA] Comando recebido. Abrindo menu...');
+    try {
+      console.warn(`[SHOP_DEBUG] command:${player.name}:${rawMessage}`);
+    } catch (error) {
+    }
+    system.runTimeout(() => {
+      void openMainShop(player);
+    }, 8);
     return;
   }
 
@@ -1211,7 +1452,7 @@ world.beforeEvents.chatSend.subscribe((event) => {
       send(player, `\u00a77Reino: \u00a76${readProfileValue(bundle.profile?.kingdomName, 'Sem reino')}`);
       send(player, `\u00a77Nação: \u00a7b${readProfileValue(bundle.profile?.nationName, 'Sem nação')}`);
       send(player, `\u00a77Raça: \u00a7d${readProfileValue(bundle.profile?.race, 'Sem raça')}`);
-      send(player, `\u00a77Classe: \u00a76${readProfileValue(bundle.profile?.className, 'Sem classe')}`);
+      send(player, `\u00a77Cargo: \u00a76${readProfileValue(bundle.profile?.className, 'Cidadao')}`);
       send(player, `\u00a77Título: \u00a7a${readProfileValue(bundle.profile?.title, 'Sem título')}`);
       if (!refresh.ok) {
         send(player, `\u00a7e[NETWORK] Exibindo cache local (${refresh.error}).`);
@@ -1223,7 +1464,7 @@ world.beforeEvents.chatSend.subscribe((event) => {
   if (message === '!netsave') {
     event.cancel = true;
     system.run(async () => {
-      const result = await savePlayerState(player);
+      const result = await savePlayerState(player, { reason: 'command_netsave' });
       if (!result.ok) {
         send(player, `\u00a7c[NETWORK] Falha ao salvar: ${result.error}`);
         return;
